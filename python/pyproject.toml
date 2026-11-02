@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "indykite-delegated-token"
+description = "IndyKite delegated token propagation for AI agents and MCP servers"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+version = "0.0.0"
+authors = [
+    { name = "IndyKite", email = "develop@indykite.com" },
+]
+keywords = ["indykite", "delegated-token", "token-propagation", "a2a", "mcp", "agents"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/indykite/indykite-delegated-token"
+Source = "https://github.com/indykite/indykite-delegated-token/tree/master/python"
+"Developer Guides" = "https://developer.indykite.com"
+Changelog = "https://github.com/indykite/indykite-delegated-token/blob/master/python/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "bandit[toml]",
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["indykite_delegated_token*"]
+
+[tool.setuptools.package-data]
+indykite_delegated_token = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["indykite_delegated_token"]
+omit = [
+    "tests/*",
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["indykite_delegated_token", "tests"]
+
+#
+# 'ruff' - the linter and formatter
+# https://github.com/astral-sh/ruff
+[tool.ruff]
+target-version = 'py311'
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # flake8-annotations
+    "ANN",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**" = ["ANN"]
+
+[tool.ruff.format]
+quote-style = 'double'
+
+#
+# 'bandit' config section
+# https://bandit.readthedocs.io/en/latest/config.html
+#
+[tool.bandit]
+exclude_dirs = ['tests', '.venv']

@@ -1,0 +1,305 @@
+---
+# Copyright (c) 2025 IndyKite
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Usage & installation, the first configures the default stages only, the others must be installed explicitly:
+#   pre-commit install
+#   pre-commit install -t post-checkout -t commit-msg
+#
+# Prerequisites:
+#   brew install pre-commit yamlfmt yamllint actionlint markdownlint-cli2 shellcheck shfmt trivy uv pnpm
+#
+# Update hooks and their dependencies regularly via:
+#   (remote) pre-commit autoupdate --freeze --jobs $(getconf _NPROCESSORS_ONLN)
+#   (local) brew update && brew upgrade -g
+#
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+
+default_stages: [pre-commit, pre-push]
+default_install_hook_types: [pre-commit]
+fail_fast: false
+minimum_pre_commit_version: 4.0.0
+
+#
+repos:
+  - repo: meta
+    hooks:
+      # - id: check-hooks-apply
+      - id: check-useless-excludes
+        name: pre-commit/check-useless-excludes
+
+  # Hooks shared across IndyKite repositories, defined here rather than pulled from the private 'ops-common'
+  # repository, so the config initialises without any credentials (external contributors and fork PRs included).
+  - repo: local
+    hooks:
+      # POST-CHECKOUT
+      # install explicitly with: pre-commit install -t post-checkout
+      - id: git-pull
+        name: git pull
+        entry: bash -c '[[ $(git branch --show-current) =~ ^(dev|develop|main|master)$ ]] && git pull --all || true'
+        language: system
+        stages: [post-checkout]
+        verbose: true
+        always_run: true
+        pass_filenames: false
+      - id: git-branch-delete-stale
+        name: Delete stale committed branches
+        entry: >-
+          bash -c '[[ $(git branch --show-current) =~ ^(dev|develop|main|master)$ ]] \
+            && (git fetch -p && git branch -vv | grep ":\ gone]" | awk "{ print \$1 }" | xargs git branch -D) \
+            || true'
+        language: system
+        stages: [post-checkout]
+        verbose: true
+        always_run: true
+        pass_filenames: false
+
+      # pre-commit validations
+      - id: pre-commit-validate-config
+        name: pre-commit/validate-config
+        files: .pre-commit-config.yaml
+        entry: pre-commit validate-config
+        language: system
+        pass_filenames: false
+      - id: pre-commit-validate-manifest
+        name: pre-commit/validate-manifest
+        files: .pre-commit-config.yaml
+        entry: pre-commit validate-manifest
+        language: system
+        pass_filenames: false
+
+      # SAST
+      - id: trivy
+        name: trivy
+        entry: trivy filesystem --disable-telemetry --skip-version-check --exit-code=1 --config .trivy.yaml .
+        language: system
+        pass_filenames: false
+
+      # Shellcheck
+      - id: shfmt
+        name: shfmt
+        types: [shell]
+        exclude_types: [csh, tcsh, zsh]
+        entry: shfmt
+        args: [--list, --write, --diff, --indent, "4"]
+        language: system
+        pass_filenames: true
+      - id: shellcheck
+        name: shellcheck
+        files: .*\.sh$
+        entry: shellcheck -S style -o all
+        language: system
+        pass_filenames: true
+
+  #
+  # Renovate
+  - repo: https://github.com/renovatebot/pre-commit-hooks # ci:ignore:OK to validate locally only, otherwise it adds 850MB+ to unpacked cache
+    rev: "44.151.2" # frozen: 43.285.7
+    hooks:
+      - id: renovate-config-validator
+        args: [--strict]
+
+  #
+  # Commit Message linting
+  - repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook # ci:ignore:executed under a separate GitHub action
+    rev: 1f1ac45c93d1c2ce36b71330252c489a5f4f2724 # frozen: v9.27.0
+    hooks:
+      # NON-DEFAULT stage, install explicitly with: pre-commit install -t commit-msg
+      - id: commitlint
+        stages: [commit-msg]
+        # not the best of using shareable config across the org
+        # 'strict' equals to 'failOnWarnings' in Github Action setting
+        args: ["--strict", "--config", "../.github/.github/actions/commitlint/.commitlintrc.mjs"]
+        additional_dependencies:
+          - "@commitlint/config-conventional"
+          - commitlint-plugin-function-rules
+
+  #
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
+    hooks:
+      # Git style
+      - id: check-added-large-files
+        args: [--maxkb=1500]
+      - id: check-merge-conflict
+      - id: check-vcs-permalinks
+      - id: forbid-new-submodules
+      # - id: forbid-submodules # XXX: either of two is enough
+      - id: no-commit-to-branch
+        name: no-commit-to-master
+        args: [--branch, dev, --branch, develop, --branch, master, --branch, main]
+
+      # Common errors
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: check-symlinks
+      - id: destroyed-symlinks
+
+      # Cross platform
+      - id: check-illegal-windows-names
+      - id: check-case-conflict
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+      # Format linters
+      # 'check-yaml' and 'sort-simple-yaml' disabled intentionally, use hooks below
+      - id: check-xml
+      - id: check-toml
+      - id: check-json
+      - id: pretty-format-json
+        args: [--no-sort-keys, --autofix]
+        exclude: ^typescript/ # prettier owns the formatting of the TypeScript package
+
+      # Security
+      - id: detect-private-key
+      - id: detect-aws-credentials
+        args: [--allow-missing-credentials]
+
+      # Python
+      - id: check-ast
+        name: python-check-ast
+      - id: check-builtin-literals
+        name: python-check-builtin-literals
+      - id: check-docstring-first
+        name: python-check-docstring-first
+      - id: debug-statements
+        name: python-debug-statements
+      - id: name-tests-test
+        name: python-name-tests-test
+        args: [--pytest-test-first]
+        files: ^python/tests/
+      - id: requirements-txt-fixer
+        name: python-requirements-txt-fixer
+
+  #
+  # more Python
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: 17e12779811926f000bdfa1795f9e3735dd71ac3 # frozen: 0.26
+    hooks:
+      - id: validate-pyproject
+        name: python-validate-pyproject
+        files: ^python/pyproject\.toml$ # the hook's default only matches a root 'pyproject.toml'
+
+  - repo: local # ci:ignore:checked by the 'Python' and 'TypeScript' workflows, which install the toolchains
+    hooks:
+      - id: uv-lock
+        name: python-uv-lock
+        language: system
+        entry: uv lock --check --directory python
+        files: ^python/(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+      - id: pnpm-lock
+        name: typescript-pnpm-lock
+        language: system
+        entry: pnpm --dir typescript install --frozen-lockfile --prefer-offline --ignore-scripts
+        files: ^typescript/(package\.json|pnpm-lock\.yaml)$
+        pass_filenames: false
+      - id: prettier
+        name: typescript-prettier
+        language: system
+        entry: pnpm --dir typescript format:check
+        files: ^typescript/
+        pass_filenames: false
+      - id: eslint
+        name: typescript-eslint
+        language: system
+        entry: pnpm --dir typescript lint
+        files: ^typescript/.*\.[cm]?[jt]s$
+        pass_filenames: false
+      - id: tsc
+        name: typescript-tsc
+        language: system
+        entry: pnpm --dir typescript typecheck
+        files: ^typescript/.*\.[cm]?ts$
+        pass_filenames: false
+
+  #
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 25bcf95026b96e2dd3c0aec3090c3d6ef6ca2e6c # frozen: v0.17.3
+    hooks:
+      - id: ruff-format
+        name: python-ruff-format
+      - id: ruff-check
+        name: python-ruff-check
+        args: [--fix] # enable autofixes
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 92ae8b82fb422a639f0ed8d99e96cea769594e08 # frozen: 1.9.4
+    hooks:
+      - id: bandit
+        name: python-bandit
+        args: ["-c", "python/pyproject.toml"]
+        additional_dependencies: ["bandit[toml]"]
+
+  #
+  # Detect hardcoded secrets
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
+    hooks:
+      - id: gitleaks
+        name: gitleaks
+
+  #
+  # YAML
+  # - repo: https://github.com/rhysd/actionlint <- "language: golang" slower & takes larger CI cache comparing to "system"
+  #   rev: v1.7.7
+  - repo: local
+    hooks:
+      # place any overrides in '.actionlint.yaml' https://github.com/rhysd/actionlint/blob/main/docs/config.md
+      #   args: ["-config-file=.actionlint.yaml"]
+      - id: actionlint-system
+        name: github-actionlint
+        language: system
+        entry: actionlint
+        types: [yaml]
+        files: ^\.github/workflows/
+  # - repo: https://github.com/google/yamlfmt <- "language: golang" slower & takes larger CI cache comparing to "system"
+  #   rev: v0.17.2
+  - repo: local
+    hooks:
+      - id: yamlfmt
+        name: yamlfmt
+        language: system
+        entry: yamlfmt
+        types: [yaml]
+        exclude: (^|/)pnpm-lock\.yaml$
+  # - repo: https://github.com/adrienverge/yamllint <- "language: python" slower & takes larger CI cache comparing to "system"
+  #   rev: v1.37.1
+  - repo: local
+    hooks:
+      - id: yamllint
+        name: yamllint
+        language: system
+        entry: yamllint
+        types: [yaml]
+        exclude: (^|/)pnpm-lock\.yaml$
+        args: ["--strict"]
+
+  #
+  # Markdown
+  # - repo: https://github.com/DavidAnson/markdownlint-cli2 <- "language: node" slower & takes larger CI cache comparing to "system"
+  #   rev: v0.18.1
+  - repo: local
+    hooks:
+      - id: markdownlint
+        name: markdownlint
+        language: system
+        entry: markdownlint-cli2
+        types: [markdown]
+        exclude: (^|/)CHANGELOG\.md$|^\.github\/ISSUE_TEMPLATE\/

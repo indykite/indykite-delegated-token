@@ -1,0 +1,43 @@
+---
+name: pre-commit cache
+
+on: # yamllint disable-line rule:truthy
+  workflow_dispatch: {}
+  push:
+    branches: ["dev", "develop", "main", "master"]
+  schedule:
+    # GitHub Actions does not support the non-standard syntax @monthly, @weekly, @daily, etc.
+    # - cron: "15 0 * * *" # daily at 00:15 UTC
+    - cron: "15 0 1 * *" # low activity repos can do just the first day of the month at 00:15 UTC
+
+permissions:
+  contents: write # required for trivy to upload artifacts
+  security-events: write # required for trivy to upload SARIF to GitHub Security tab (master only)
+  actions: write # required for trivy to upload SBOM artifact (master only)
+
+jobs:
+  pre-commit:
+    name: pre-commit-cache
+    runs-on: ubuntu-latest
+    steps:
+      - name: pre-commit
+        uses: indykite/.github/.github/actions/pre-commit@master
+        with:
+          pre_commit_skip: >-
+            commitlint,trivy,trivy-conf,trivy-filesystem
+            ${{ vars.PRE_COMMIT_SKIP != null && ',' || '' }}${{ vars.PRE_COMMIT_SKIP }}
+            ${{ format('{0}', github.event_name != 'pull_request' && ',pre-commit-autoupdate,no-commit-to-branch' || '' ) }}
+  trivy:
+    name: trivy
+    runs-on: ubuntu-latest
+    steps:
+      - name: trivy
+        uses: indykite/.github/.github/actions/trivy@master
+        with:
+          scanners: vuln,secret,misconfig,license
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          jira-cloud-id: ${{ secrets.JIRA_CLOUD_ID }}
+          jira-watchers: ${{ secrets.TRIVY_JIRA_WATCHERS }}
+          github-app-client-id: ${{ vars.IK_CODE_WRITER_CLIENT_ID }}
+          github-app-private-key: ${{ secrets.IK_CODE_WRITER_PEM }}

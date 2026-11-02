@@ -1,0 +1,16 @@
+---
+# Filters for 'dorny/paths-filter' in '.github/workflows/ci.yaml': each language runs only when its files changed.
+# A change to 'ci.yaml' itself runs every language.
+shared: &shared
+  - ".github/workflows/ci.yaml"
+  - ".github/paths-filter.yaml"
+
+python:
+  - *shared
+  - "python/**"
+  - ".github/workflows/python.yaml"
+
+typescript:
+  - *shared
+  - "typescript/**"
+  - ".github/workflows/typescript.yaml"

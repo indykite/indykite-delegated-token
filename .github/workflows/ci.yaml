@@ -1,0 +1,89 @@
+---
+name: CI
+
+on: # yamllint disable-line rule:truthy
+  pull_request:
+    branches: ["dev", "develop", "main", "master"]
+  push:
+    branches: ["dev", "develop", "main", "master"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Each language is checked by its reusable '<language>.yaml' workflow, called only when its files changed
+# (filters in '.github/paths-filter.yaml').
+# The '<Language>' gate jobs are the required status checks, independent of the job names and matrices of the workflows.
+# To add a language: a filter, an output, a job calling its workflow, and a gate job.
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter reads the PR's changed files via the GitHub API on pull_request events
+    outputs:
+      # manual runs check every language
+      python: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
+      typescript: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.typescript == 'true' }}
+    steps:
+      - name: actions/checkout
+        uses: indykite/.github/.github/actions/git-checkout@master # actions/checkout with dynamic fetch-depth resolution
+        id: checkout
+
+      - name: Detect changed files
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3 - https://github.com/dorny/paths-filter/releases
+        id: filter
+        with:
+          filters: .github/paths-filter.yaml
+          initial-fetch-depth: ${{ steps.checkout.outputs.fetch-depth }}
+
+  #
+  # Python
+  python:
+    name: Python CI
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    uses: ./.github/workflows/python.yaml
+    secrets: inherit
+
+  python-gate:
+    name: Python
+    if: always()
+    needs: [changes, python]
+    runs-on: ubuntu-slim
+    steps:
+      - name: Check results
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RESULT: ${{ needs.python.result }}
+        run: |-
+          echo "changes: ${CHANGES}, python: ${RESULT}"
+          [[ "${CHANGES}" == "success" && ("${RESULT}" == "success" || "${RESULT}" == "skipped") ]]
+
+  #
+  # TypeScript
+  typescript:
+    name: TypeScript CI
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
+    uses: ./.github/workflows/typescript.yaml
+    secrets: inherit
+
+  typescript-gate:
+    name: TypeScript
+    if: always()
+    needs: [changes, typescript]
+    runs-on: ubuntu-slim
+    steps:
+      - name: Check results
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RESULT: ${{ needs.typescript.result }}
+        run: |-
+          echo "changes: ${CHANGES}, typescript: ${RESULT}"
+          [[ "${CHANGES}" == "success" && ("${RESULT}" == "success" || "${RESULT}" == "skipped") ]]

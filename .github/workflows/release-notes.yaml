@@ -1,0 +1,34 @@
+---
+name: Release notes
+on: # yamllint disable-line rule:truthy
+  push:
+    branches: ["dev", "develop", "main", "master"]
+
+# https://github.com/googleapis/release-please-action?tab=readme-ov-file#workflow-permissions
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency: release-notes
+
+jobs:
+  release-please:
+    name: Prepare Release notes
+    runs-on: ubuntu-slim
+    steps:
+      - name: Mint ik-code-writer installation token
+        id: code_writer_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.IK_CODE_WRITER_CLIENT_ID }}
+          private-key: ${{ secrets.IK_CODE_WRITER_PEM }}
+          owner: indykite
+          repositories: indykite-delegated-token
+      - name: action/release-please
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0 - https://github.com/googleapis/release-please-action/releases
+        id: release
+        with:
+          token: ${{ steps.code_writer_token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
