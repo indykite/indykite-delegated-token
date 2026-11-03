@@ -1,0 +1,61 @@
+{
+  "name": "@indykite/delegated-token",
+  "version": "0.0.0",
+  "description": "IndyKite delegated token propagation for AI agents and MCP servers",
+  "keywords": [
+    "indykite",
+    "delegated-token",
+    "token-propagation",
+    "a2a",
+    "mcp",
+    "agents"
+  ],
+  "homepage": "https://github.com/indykite/indykite-delegated-token/tree/master/typescript#readme",
+  "bugs": "https://github.com/indykite/indykite-delegated-token/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/indykite/indykite-delegated-token.git",
+    "directory": "typescript"
+  },
+  "license": "Apache-2.0",
+  "author": "IndyKite <develop@indykite.com>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist coverage",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "prepack": "pnpm run clean && pnpm run build",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.5",
+    "@vitest/coverage-v8": "5.0.5",
+    "eslint": "10.14.0",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.0.5"
+  },
+  "packageManager": "pnpm@11.10.0"
+}

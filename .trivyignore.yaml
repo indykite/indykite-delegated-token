@@ -1,0 +1,14 @@
+---
+# https://trivy.dev/latest/docs/configuration/filtering/#trivyignoreyaml
+licenses:
+  # the project's own copyright headers, not third-party findings
+  - id: Apache-2.0
+    paths:
+      - "python/indykite_delegated_token/**"
+      - "python/tests/**"
+      - "typescript/*.js"
+      - "typescript/*.ts"
+      - "typescript/src/**"
+      - "typescript/test/**"
+      - "typescript/dist/**"
+    statement: IndyKite copyright header of first-party source code

@@ -1,0 +1,27 @@
+---
+coverage:
+  status:
+    project:
+      default:
+        target: 90%
+        threshold: 3%
+    patch:
+      default:
+        target: 85%
+        threshold: 10%
+
+# each language uploads its own report with its own flag
+flags:
+  python:
+    paths:
+      - python/
+    carryforward: true
+  typescript:
+    paths:
+      - typescript/
+    carryforward: true
+
+ignore:
+  - "python/tests"
+  - "typescript/test"
+  - "**/examples"
