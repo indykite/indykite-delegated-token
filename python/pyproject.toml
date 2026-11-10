@@ -28,6 +28,16 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+# MCP Python SDK 2.x: MCPServer, and the httpx2 client
+mcp = ["mcp>=2.3", "httpx2>=2.10"]
+# MCP Python SDK 1.x: FastMCP and the httpx client
+mcp1 = ["mcp>=1.30,<2", "httpx>=0.28"]
+# FastMCP 4
+fastmcp = ["fastmcp>=4", "httpx2>=2.10"]
+# A2A Python SDK
+a2a = ["a2a-sdk>=1.3", "httpx>=0.28"]
+
 [project.urls]
 Homepage = "https://github.com/indykite/indykite-delegated-token"
 Source = "https://github.com/indykite/indykite-delegated-token/tree/master/python"
@@ -36,12 +46,39 @@ Changelog = "https://github.com/indykite/indykite-delegated-token/blob/master/py
 
 [dependency-groups]
 dev = [
+    "anyio",
     "bandit[toml]",
+    "httpx",
+    "httpx2",
     "mypy",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
     "ruff",
+    "starlette",
+    "uvicorn",
+]
+# mcp 1.x and 2.x share the import name `mcp`, so the tests of each run in their own environment, see [tool.uv]
+mcp1 = [
+    "a2a-sdk[http-server]>=1.3",
+    "mcp>=1.30,<2",
+]
+mcp2 = [
+    "a2a-sdk[http-server]>=1.3",
+    "fastmcp>=4",
+    "mcp>=2.3",
+]
+
+[tool.uv]
+# `uv run pytest` tests against mcp 2.x; `uv run --no-group mcp2 --group mcp1 pytest` against mcp 1.x
+default-groups = ["dev", "mcp2"]
+conflicts = [
+    [{ group = "mcp1" }, { group = "mcp2" }],
+    [{ extra = "mcp1" }, { extra = "mcp" }],
+    [{ extra = "mcp1" }, { extra = "fastmcp" }],
+    [{ extra = "mcp1" }, { group = "mcp2" }],
+    [{ extra = "mcp" }, { group = "mcp1" }],
+    [{ extra = "fastmcp" }, { group = "mcp1" }],
 ]
 
 [tool.setuptools.packages.find]
@@ -53,6 +90,7 @@ indykite_delegated_token = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.coverage.run]
 source = ["indykite_delegated_token"]
@@ -64,6 +102,11 @@ omit = [
 strict = true
 python_version = "3.11"
 files = ["indykite_delegated_token", "tests"]
+
+[[tool.mypy.overrides]]
+# the tests register tools through the untyped decorators of the SDKs
+module = ["_harness", "test_install", "test_propagation"]
+disallow_untyped_decorators = false
 
 #
 # 'ruff' - the linter and formatter
@@ -92,6 +135,8 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["ANN"]
+# the tests drive the MCP and A2A SDKs of either major version, whose objects they handle dynamically
+"tests/**" = ["ANN401"]
 
 [tool.ruff.format]
 quote-style = 'double'
