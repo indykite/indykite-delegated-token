@@ -6,6 +6,7 @@ licenses:
     paths:
       - "python/indykite_delegated_token/**"
       - "python/tests/**"
+      - "python/examples/**"
       - "typescript/*.js"
       - "typescript/*.ts"
       - "typescript/src/**"

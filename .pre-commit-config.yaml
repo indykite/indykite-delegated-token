@@ -184,6 +184,7 @@ repos:
         name: python-name-tests-test
         args: [--pytest-test-first]
         files: ^python/tests/
+        exclude: ^python/tests/_harness\.py$ # in-process servers shared by the tests
       - id: requirements-txt-fixer
         name: python-requirements-txt-fixer
 
