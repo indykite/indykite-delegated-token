@@ -1,0 +1,68 @@
+---
+# https://trivy.dev/latest/docs/references/configuration/config-file/
+report: "all"
+exit-code: 1
+insecure: false
+debug: false
+quiet: true
+timeout: 10m
+dependency-tree: true
+list-all-pkgs: true
+format: "table"
+# output: result.json
+ignorefile: ".trivyignore.yaml"
+
+severity:
+  - UNKNOWN
+  - LOW
+  - MEDIUM
+  - HIGH
+  - CRITICAL
+
+# [EXPERIMENTAL] tables that will be displayed in 'table' format, default '[summary,detailed]'
+# explicit setting breaks CI's 'github' format
+# table-mode:
+#   - summary
+#   - detailed
+
+scan:
+  detection-priority: "precise"
+  disable-telemetry: true
+  offline: true
+  scanners:
+    # - vuln # keep disabled so not checked on PRs but explicitly via scheduled .github/workflows/pre-commit-cache.yaml
+    - secret
+    - misconfig
+    - license
+  skip-dirs: ["**/.terraform/**", "**/.terragrunt-cache/**", "**/.venv/**", "**/node_modules/**"]
+  skip-files: ["LICENSE", "python/LICENSE", "typescript/LICENSE"] # the project's own license, not a third-party finding
+  show-suppressed: true
+
+vulnerability:
+  ignore-unfixed: false
+
+misconfiguration:
+  include-non-failures: false
+  scanners:
+    # - azure-arm
+    # - cloudformation
+    - dockerfile
+    - helm
+    - kubernetes
+    - terraform
+    - terraformplan-json
+    - terraformplan-snapshot
+
+  terraform:
+    exclude-downloaded-modules: true
+
+pkg:
+  include-dev-deps: true # supported: npm, yarn, gradle
+
+# https://trivy.dev/latest/docs/references/configuration/config-file/#license-options
+license:
+  confidenceLevel: 0.9 # '--license-confidence-level'
+  full: true # '--license-full'
+  # forbidden: []
+  # permissive: []
+  ignored: [] # '--ignored-licenses'

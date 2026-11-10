@@ -1,0 +1,36 @@
+# OS & IDE files
+.DS_Store
+.idea
+.vscode
+
+# Environments
+.env
+.env.*
+
+#
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.python-version
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+#
+# TypeScript
+node_modules/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*

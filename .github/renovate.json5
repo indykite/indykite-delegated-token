@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>indykite/.github//.github/renovate.json5"
+  ],
+  // the org preset groups all minor and patch updates into one PR, split it by language instead,
+  // so each PR changes one package and release-please releases only that one; majors stay separate PRs
+  "packageRules": [
+    {
+      "description": "Python: minor and patch updates in one PR",
+      "matchFileNames": ["python/**"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "python non-major dependencies",
+      "groupSlug": "python-minor-patch",
+      "commitMessagePrefix": "chore(python): "
+    },
+    {
+      "description": "TypeScript: minor and patch updates in one PR",
+      "matchFileNames": ["typescript/**"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "typescript non-major dependencies",
+      "groupSlug": "typescript-minor-patch",
+      "commitMessagePrefix": "chore(typescript): "
+    }
+  ]
+}
