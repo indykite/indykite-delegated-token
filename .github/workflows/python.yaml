@@ -14,8 +14,17 @@ defaults:
 
 jobs:
   lint:
-    name: Lint
+    name: Lint (${{ matrix.sdk }})
     runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        # mcp 1.x and 2.x share the import name `mcp`, so each adapter is type checked in its own environment
+        include:
+          - sdk: mcp1
+            mypy-exclude: server/(mcp_v2|fastmcp)\.py
+          - sdk: mcp2
+            mypy-exclude: server/mcp_v1\.py
     steps:
       - name: actions/checkout
         uses: indykite/.github/.github/actions/git-checkout@master # actions/checkout with dynamic fetch-depth resolution
@@ -28,27 +37,34 @@ jobs:
           cache-dependency-glob: python/uv.lock
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --no-default-groups --group dev --group ${{ matrix.sdk }}
 
       - name: ruff check
-        run: uv run ruff check --output-format=github
+        if: matrix.sdk == 'mcp2'
+        run: uv run --no-sync ruff check --output-format=github
 
       - name: ruff format
-        run: uv run ruff format --check
+        if: matrix.sdk == 'mcp2'
+        run: uv run --no-sync ruff format --check
 
       - name: mypy
-        run: uv run mypy
+        env:
+          MYPY_EXCLUDE: ${{ matrix.mypy-exclude }}
+        run: uv run --no-sync mypy --follow-imports=silent --exclude "$MYPY_EXCLUDE"
 
       - name: bandit
-        run: uv run bandit -c pyproject.toml -r .
+        if: matrix.sdk == 'mcp2'
+        run: uv run --no-sync bandit -c pyproject.toml -r .
 
   test:
-    name: Tests (Python ${{ matrix.python-version }})
+    name: Tests (Python ${{ matrix.python-version }}, ${{ matrix.sdk }})
     runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # mcp 1.x and 2.x share the import name `mcp`; the tests of the other one are skipped
+        sdk: [mcp1, mcp2]
     steps:
       - name: actions/checkout
         uses: indykite/.github/.github/actions/git-checkout@master # actions/checkout with dynamic fetch-depth resolution
@@ -61,12 +77,13 @@ jobs:
           cache-dependency-glob: python/uv.lock
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --no-default-groups --group dev --group ${{ matrix.sdk }}
 
       - name: Run unit tests
-        run: uv run pytest --cov --cov-report xml
+        run: uv run --no-sync pytest --cov --cov-report xml
 
       - name: Build package
+        if: matrix.sdk == 'mcp2'
         run: uv build
 
       - name: codecov/upload-coverage
