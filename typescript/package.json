@@ -1,6 +1,6 @@
 {
   "name": "@indykite/delegated-token",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "IndyKite delegated token propagation for AI agents and MCP servers",
   "keywords": [
     "indykite",
