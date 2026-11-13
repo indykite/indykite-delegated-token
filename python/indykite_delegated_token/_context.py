@@ -14,7 +14,7 @@
 
 """The delegated token of the request being handled."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -41,23 +41,25 @@ def use_token(token: str | None) -> Iterator[None]:
         _delegated_token.reset(reset)
 
 
-def token_from_headers(headers: object) -> str | None:
-    """Read the delegated token from a headers mapping, case-insensitively.
+def _text(value: object) -> object:
+    return value.decode("latin-1") if isinstance(value, bytes) else value
 
-    Accepts Starlette ``Headers`` and plain mappings. Returns ``None`` when the header is missing or empty.
+
+def token_in(pairs: Iterable[tuple[object, object]]) -> str | None:
+    """The delegated token in header ``(name, value)`` pairs, case-insensitively, as ``str`` or latin-1 ``bytes``.
+
+    Returns ``None`` when the header is missing or empty.
     """
-    getter = getattr(headers, "get", None)
-    if getter is None:
-        return None
-    value = getter(DELEGATED_TOKEN_HEADER) or getter(DELEGATED_TOKEN_HEADER.lower())
-    if value is None and hasattr(headers, "items"):
-        wanted = DELEGATED_TOKEN_HEADER.lower()
-        for name, item in headers.items():
-            if isinstance(name, str) and name.lower() == wanted:
-                value = item
-                break
-    if isinstance(value, bytes):
-        value = value.decode("latin-1")
-    if not isinstance(value, str) or not value:
-        return None
-    return value
+    wanted = DELEGATED_TOKEN_HEADER.lower()
+    for name, value in pairs:
+        name = _text(name)
+        if isinstance(name, str) and name.lower() == wanted:
+            value = _text(value)
+            return value if isinstance(value, str) and value else None
+    return None
+
+
+def token_from_headers(headers: object) -> str | None:
+    """Read the delegated token from a headers mapping, such as Starlette ``Headers``, see :func:`token_in`."""
+    items = getattr(headers, "items", None)
+    return token_in(items()) if items is not None else None

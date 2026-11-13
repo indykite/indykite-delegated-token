@@ -42,8 +42,7 @@ def _token() -> str | None:
         request = request_ctx.get().request
     except LookupError:
         return None
-    headers = getattr(request, "headers", None)
-    return token_from_headers(headers) if headers is not None else None
+    return token_from_headers(getattr(request, "headers", None))
 
 
 def _wrap(handler: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:

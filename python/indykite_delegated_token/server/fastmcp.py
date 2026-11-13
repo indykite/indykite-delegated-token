@@ -32,8 +32,7 @@ def _token() -> str | None:
     # stateful session, which would leak that request's token to later messages.
     request_context = fastmcp_request_ctx.get()
     request = request_context.request if request_context is not None else None
-    headers = getattr(request, "headers", None)
-    return token_from_headers(headers) if headers is not None else None
+    return token_from_headers(getattr(request, "headers", None))
 
 
 class DelegatedTokenMiddleware(Middleware):
