@@ -121,7 +121,12 @@ repos:
         stages: [commit-msg]
         # not the best of using shareable config across the org
         # 'strict' equals to 'failOnWarnings' in Github Action setting
-        args: ["--strict", "--config", "../.github/.github/actions/commitlint/.commitlintrc.mjs"]
+        args:
+          [
+            "--strict",
+            "--config",
+            "../.github/.github/actions/commitlint/.commitlintrc.mjs",
+          ]
         additional_dependencies:
           - "@commitlint/config-conventional"
           - commitlint-plugin-function-rules
@@ -139,7 +144,8 @@ repos:
       # - id: forbid-submodules # XXX: either of two is enough
       - id: no-commit-to-branch
         name: no-commit-to-master
-        args: [--branch, dev, --branch, develop, --branch, master, --branch, main]
+        args:
+          [--branch, dev, --branch, develop, --branch, master, --branch, main]
 
       # Common errors
       - id: end-of-file-fixer
