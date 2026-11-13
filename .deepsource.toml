@@ -2,6 +2,8 @@
 version = 1
 
 test_patterns = ["python/tests/**", "typescript/test/**"]
+# The Python tests are checked by ruff and mypy; DeepSource would only ask for a docstring on every test function
+exclude_patterns = ["python/tests/**"]
 
 #
 [[analyzers]]
