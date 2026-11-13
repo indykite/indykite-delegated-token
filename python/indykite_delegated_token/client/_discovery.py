@@ -135,10 +135,6 @@ def _announces(target: str, status: int, body: bytes) -> bool:
         return False
 
 
-def _cacheable(status: int) -> bool:
-    return 200 <= status < 300 or status == 404
-
-
 class _Attempt:
     """A metadata fetch in progress, whose result its concurrent callers share."""
 
@@ -221,7 +217,7 @@ class ExtensionRegistry:
             logger.warning("fetching protected resource metadata %s failed: %s", url, exc)
             return False
         announced = _announces(key, status, body)
-        if _cacheable(status):
+        if 200 <= status < 300 or status == 404:
             # A slower fetch of the well-known URL must not undo what a challenge's link has shown
             self._announced[key] = announced or self._announced.get(key, False)
         else:

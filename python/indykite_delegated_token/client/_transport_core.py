@@ -16,14 +16,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, MutableMapping
-from typing import Protocol, TypeVar
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from types import TracebackType
+from typing import Any, Protocol, Self, TypeVar
 
 from indykite_delegated_token._constants import DELEGATED_TOKEN_HEADER
 from indykite_delegated_token._context import get_delegated_token
 from indykite_delegated_token.client._discovery import ExtensionRegistry, challenge_link, same_origin
 
-__all__ = ["MAX_BODY", "READ_DEADLINE", "handle"]
+__all__ = [
+    "MAX_BODY",
+    "METADATA_HEADERS",
+    "READ_DEADLINE",
+    "Replay",
+    "WrappingTransport",
+    "handle",
+    "metadata_timeout",
+    "read_raw",
+]
 
 # The most of a metadata answer or of a 401 that is read: both are small, and a target must not be able to make the
 # client hold a large body in memory
@@ -31,6 +41,11 @@ MAX_BODY = 64 * 1024
 # Seconds the package's own reads may take in all, whatever the per-operation timeouts, so a body that trickles in
 # cannot hold up the call: a metadata fetch, and the read of a 401 before discovery
 READ_DEADLINE = 30.0
+# Headers of the metadata fetch: uncompressed only, so the size limit on the body holds for what is decoded too
+METADATA_HEADERS = {"Accept": "application/json", "Accept-Encoding": "identity"}
+# Seconds of the metadata fetch's timeouts that the request leaves unset, so a stalled endpoint cannot block the call
+# forever
+_METADATA_TIMEOUT = 10.0
 
 
 class _Headers(Protocol):
@@ -58,6 +73,17 @@ class _Response(Protocol):
     async def aclose(self) -> None: ...
 
 
+class _Transport(Protocol):
+    async def __aenter__(self) -> Any: ...  # noqa: ANN401 - the transport itself
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None: ...
+    async def aclose(self) -> None: ...
+
+
 # Request extension with the URL of the first request of a redirect chain: the client copies the extensions of a
 # request into the redirect it builds from it
 _FIRST_URL = "indykite_delegated_token.first_url"
@@ -78,6 +104,94 @@ def _replayable(request: _Request) -> bool:
     except Exception:
         return False
     return True
+
+
+def metadata_timeout(request: _Request) -> dict[str, Any]:
+    """The timeouts of the metadata fetch for ``request``: its own, with 10 seconds for those it leaves unset.
+
+    Only the timeout is taken from the request, never its headers, credentials included. The metadata fetch is the
+    package's own request, so it is bounded even when the client has no timeout.
+    """
+    timeout: dict[str, Any] = dict.fromkeys(("connect", "read", "write", "pool"), _METADATA_TIMEOUT)
+    requested: Any = request.extensions.get("timeout") or {}
+    timeout.update((key, value) for key, value in requested.items() if value is not None)
+    return timeout
+
+
+async def read_raw(
+    response: _Response, raw: AsyncIterator[bytes], limit: int, deadline: float
+) -> tuple[list[bytes], bool]:
+    """Read the raw chunks of ``response`` until the body ends or more than ``limit`` bytes arrived.
+
+    Returns the chunks and whether they are the whole body. ``deadline`` is in all, not per read: a body that trickles
+    in must not hold up the call, and raises :class:`TimeoutError`. On that and any other error the response is closed,
+    because a body read in part cannot be returned.
+    """
+    import anyio
+
+    read: list[bytes] = []
+    size = 0
+    try:
+        with anyio.fail_after(deadline):
+            async for chunk in raw:
+                read.append(chunk)
+                size += len(chunk)
+                if size > limit:
+                    return read, False
+    except BaseException:
+        with anyio.CancelScope(shield=True):  # give the connection back
+            await response.aclose()
+        raise
+    return read, True
+
+
+class Replay:
+    """The raw body chunks already read from a response, then the rest of it, if any.
+
+    Each library's module combines it with its ``AsyncByteStream``.
+    """
+
+    def __init__(self, read: list[bytes], rest: AsyncIterator[bytes] | None, response: _Response) -> None:
+        self._read = read
+        self._rest = rest
+        self._response = response
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self._chunks()
+
+    async def _chunks(self) -> AsyncIterator[bytes]:
+        for chunk in self._read:
+            yield chunk
+        if self._rest is not None:
+            async for chunk in self._rest:
+                yield chunk
+
+    async def aclose(self) -> None:
+        await self._response.aclose()
+
+
+class WrappingTransport:
+    """Opens and closes the transport it wraps, ``_transport``, with itself.
+
+    Each library's module combines it with its ``AsyncBaseTransport``.
+    """
+
+    _transport: _Transport
+
+    async def __aenter__(self) -> Self:
+        await self._transport.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self._transport.__aexit__(exc_type, exc_value, traceback)
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
 
 
 async def handle(

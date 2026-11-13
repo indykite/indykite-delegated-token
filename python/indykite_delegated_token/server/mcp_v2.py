@@ -29,17 +29,11 @@ from indykite_delegated_token._context import token_from_headers, use_token
 __all__ = ["DelegatedTokenMiddleware", "install"]
 
 
-def _token(ctx: ServerRequestContext[Any, Any]) -> str | None:
-    request = ctx.request
-    headers = getattr(request, "headers", None)
-    return token_from_headers(headers) if headers is not None else None
-
-
 class DelegatedTokenMiddleware(ServerMiddleware[Any]):
     """Runs each message with the ``X-IK-Token`` of its HTTP request as the delegated token."""
 
     async def __call__(self, ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
-        with use_token(_token(ctx)):
+        with use_token(token_from_headers(getattr(ctx.request, "headers", None))):
             return await call_next(ctx)
 
 

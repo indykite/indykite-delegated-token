@@ -20,14 +20,17 @@ transport with :class:`DelegatedTokenTransport`.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from types import TracebackType
-
-import anyio
 import httpx
 
 from indykite_delegated_token.client._discovery import DEFAULT_REGISTRY, ExtensionRegistry
-from indykite_delegated_token.client._transport_core import handle
+from indykite_delegated_token.client._transport_core import (
+    METADATA_HEADERS,
+    Replay,
+    WrappingTransport,
+    handle,
+    metadata_timeout,
+    read_raw,
+)
 
 __all__ = ["DelegatedTokenTransport", "http_client", "httpx_client_factory"]
 
@@ -35,65 +38,23 @@ __all__ = ["DelegatedTokenTransport", "http_client", "httpx_client_factory"]
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, read=300.0)
 
 
-# The metadata fetch's timeouts that the request leaves unset, so a stalled endpoint cannot block the call forever
-_METADATA_TIMEOUT = httpx.Timeout(10.0)
-
-
 def _plain_get(url: str, request: httpx.Request) -> httpx.Request:
-    # Only the timeout is taken from the request, never its headers, credentials included. The metadata fetch is the
-    # package's own request, so it is bounded even when the client has no timeout.
-    timeout = _METADATA_TIMEOUT.as_dict()
-    timeout.update((key, value) for key, value in request.extensions.get("timeout", {}).items() if value is not None)
-    # Uncompressed only, so the size limit on the body holds for what is decoded too
-    headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
-    return httpx.Request("GET", url, headers=headers, extensions={"timeout": timeout})
+    return httpx.Request("GET", url, headers=METADATA_HEADERS, extensions={"timeout": metadata_timeout(request)})
 
 
-class _Replay(httpx.AsyncByteStream):
-    """The raw body chunks already read from a response, then the rest of it, if any."""
-
-    def __init__(self, read: list[bytes], rest: AsyncIterator[bytes] | None, response: httpx.Response) -> None:
-        self._read = read
-        self._rest = rest
-        self._response = response
-
-    def __aiter__(self) -> AsyncIterator[bytes]:
-        return self._chunks()
-
-    async def _chunks(self) -> AsyncIterator[bytes]:
-        for chunk in self._read:
-            yield chunk
-        if self._rest is not None:
-            async for chunk in self._rest:
-                yield chunk
-
-    async def aclose(self) -> None:
-        await self._response.aclose()
+class _Replay(Replay, httpx.AsyncByteStream):
+    """:class:`Replay` as an ``httpx`` stream."""
 
 
 async def _buffer(response: httpx.Response, limit: int, deadline: float) -> tuple[httpx.Response, bool]:
     if response.is_stream_consumed:  # a body given in memory, as by a mock transport, is read already
         return response, len(response.content) <= limit
     # Raw bytes, before any decompression, so the limit holds; the client decodes the replayed body as usual
-    read: list[bytes] = []
-    size = 0
     raw = response.aiter_raw()
-    complete = True
     try:
-        # In all, not per read: a body that trickles in must not hold up the call
-        with anyio.fail_after(deadline):
-            async for chunk in raw:
-                read.append(chunk)
-                size += len(chunk)
-                if size > limit:
-                    complete = False
-                    break
-    except BaseException as exc:  # a body read in part cannot be returned: give the connection back
-        with anyio.CancelScope(shield=True):
-            await response.aclose()
-        if isinstance(exc, TimeoutError):
-            raise httpx.ReadTimeout(f"response body not read within {deadline} seconds") from exc
-        raise
+        read, complete = await read_raw(response, raw, limit, deadline)
+    except TimeoutError as exc:
+        raise httpx.ReadTimeout(f"response body not read within {deadline} seconds") from exc
     stream = _Replay(read, None if complete else raw, response)
     copy = httpx.Response(response.status_code, headers=response.headers, stream=stream, extensions=response.extensions)
     return copy, complete
@@ -107,12 +68,14 @@ def _with_header(request: httpx.Request, name: str, value: str) -> httpx.Request
     )
 
 
-class DelegatedTokenTransport(httpx.AsyncBaseTransport):
+class DelegatedTokenTransport(WrappingTransport, httpx.AsyncBaseTransport):
     """Adds ``X-IK-Token`` to the requests for targets that announce the delegated token extension.
 
     The token is the one of the request being handled (:func:`get_delegated_token`). Requests without a token, and
     requests to targets that do not announce, go out unchanged. A header the caller set is never replaced.
     """
+
+    _transport: httpx.AsyncBaseTransport
 
     def __init__(
         self,
@@ -132,21 +95,6 @@ class DelegatedTokenTransport(httpx.AsyncBaseTransport):
             buffer=_buffer,
             registry=self._registry,
         )
-
-    async def __aenter__(self) -> DelegatedTokenTransport:
-        await self._transport.__aenter__()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None = None,
-        exc_value: BaseException | None = None,
-        traceback: TracebackType | None = None,
-    ) -> None:
-        await self._transport.__aexit__(exc_type, exc_value, traceback)
-
-    async def aclose(self) -> None:
-        await self._transport.aclose()
 
 
 def http_client(

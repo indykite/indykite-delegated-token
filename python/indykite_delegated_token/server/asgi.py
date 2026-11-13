@@ -26,8 +26,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
-from indykite_delegated_token._constants import DELEGATED_TOKEN_HEADER
-from indykite_delegated_token._context import use_token
+from indykite_delegated_token._context import token_in, use_token
 
 __all__ = ["DelegatedTokenASGIMiddleware"]
 
@@ -36,15 +35,6 @@ Message = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
-
-_HEADER = DELEGATED_TOKEN_HEADER.lower().encode("latin-1")
-
-
-def _token(scope: Scope) -> str | None:
-    for name, value in scope.get("headers") or ():
-        if name.lower() == _HEADER:
-            return value.decode("latin-1") or None
-    return None
 
 
 class DelegatedTokenASGIMiddleware:
@@ -57,5 +47,5 @@ class DelegatedTokenASGIMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        with use_token(_token(scope)):
+        with use_token(token_in(scope.get("headers") or ())):
             await self.app(scope, receive, send)

@@ -41,10 +41,6 @@ __all__ = [
 ]
 
 
-def _top_modules(server: object) -> set[str]:
-    return {cls.__module__.split(".", 1)[0] for cls in type(server).__mro__}
-
-
 def install(server: object) -> None:
     """Make the delegated token of each request available to the tools of ``server``.
 
@@ -57,7 +53,7 @@ def install(server: object) -> None:
     Calling it again on the same server does nothing. For other ASGI apps, such as A2A agents, wrap the app in
     :class:`indykite_delegated_token.server.asgi.DelegatedTokenASGIMiddleware` instead.
     """
-    modules = _top_modules(server)
+    modules = {cls.__module__.split(".", 1)[0] for cls in type(server).__mro__}  # top-level packages of its classes
     if "fastmcp" in modules:
         from indykite_delegated_token.server import fastmcp
 
