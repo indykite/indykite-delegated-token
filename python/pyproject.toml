@@ -105,7 +105,7 @@ files = ["indykite_delegated_token", "tests"]
 
 [[tool.mypy.overrides]]
 # the tests register tools through the untyped decorators of the SDKs
-module = ["_harness", "test_install", "test_propagation"]
+module = ["_harness", "test_asgi", "test_install", "test_propagation"]
 disallow_untyped_decorators = false
 
 #

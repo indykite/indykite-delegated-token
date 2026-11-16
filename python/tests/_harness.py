@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""In-process servers for the end-to-end tests: fake MCP targets, a fake A2A agent, and MCP client helpers.
+"""In-process servers for the end-to-end tests: fake MCP targets, a fake A2A agent, a fake gateway, and MCP client
+helpers.
 
 The helpers use whichever major version of the MCP SDK is installed, so the same tests run in both environments.
 """
@@ -30,11 +31,12 @@ from typing import Any
 
 import httpx
 import uvicorn
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from indykite_delegated_token import A2A_EXTENSION_URI, MCP_EXTENSION_ID
+from indykite_delegated_token import A2A_EXTENSION_URI, A2A_EXTENSIONS_HEADER, DELEGATED_TOKEN_HEADER, MCP_EXTENSION_ID
 from indykite_delegated_token.client import ExtensionRegistry
 
 try:
@@ -175,6 +177,89 @@ def a2a_agent(announce: bool) -> AppFactory:
         )
         handler = DefaultRequestHandler(agent_executor=Echo(), task_store=InMemoryTaskStore(), agent_card=card)
         return Starlette(routes=[*create_agent_card_routes(card), *create_jsonrpc_routes(handler, "/")])
+
+    return factory
+
+
+# Headers that belong to one connection, or that httpx sets for the forwarded request or response
+_HOP_HEADERS = {"host", "connection", "content-length", "content-encoding", "transfer-encoding", "keep-alive"}
+
+
+def _bearer(authorization: str | None) -> str | None:
+    scheme, _, credentials = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return credentials or None
+
+
+def _gateway_headers(request: Request, *, token_service: bool, hop: str, a2a: bool) -> dict[str, str] | None:
+    """The headers of the forwarded call, or ``None`` when the gateway refuses the call."""
+    headers = {name: value for name, value in request.headers.items() if name not in _HOP_HEADERS}
+    incoming = headers.pop(DELEGATED_TOKEN_HEADER.lower(), None)  # the gateway overwrites the caller's
+    bearer = _bearer(request.headers.get("authorization"))
+    if not token_service:
+        return headers if bearer else None
+    subject = incoming or bearer  # X-IK-Token alone is enough; a bearer token only starts a workflow
+    if not subject:
+        return None
+    headers[DELEGATED_TOKEN_HEADER] = f"{subject}>{hop}"
+    extensions = headers.get(A2A_EXTENSIONS_HEADER.lower(), "")
+    if a2a and A2A_EXTENSION_URI not in extensions:
+        headers[A2A_EXTENSIONS_HEADER.lower()] = ", ".join(filter(None, [extensions, A2A_EXTENSION_URI]))
+    return headers
+
+
+def fake_gateway(upstream: str, *, token_service: bool, hop: str, a2a: bool = True) -> AppFactory:
+    """A reverse proxy to ``upstream`` that mimics the agent gateway.
+
+    With ``token_service``, the agent card lists the extension with ``required: false``, the protected resource
+    metadata announces it, and each call goes on with ``X-IK-Token: <incoming X-IK-Token or bearer subject>><hop>``.
+    A2A calls also name the extension in ``A2A-Extensions``. Without it, nothing is announced and the caller's
+    ``Authorization`` goes on, never ``X-IK-Token``. A call without the credentials the gateway needs gets 401.
+    """
+
+    def factory(base_url: str) -> Any:
+        async def card(_: Request) -> Response:
+            async with httpx.AsyncClient() as http:
+                body = (await http.get(f"{upstream}/.well-known/agent-card.json")).json()
+            body["supportedInterfaces"] = [
+                {**interface, "url": interface["url"].replace(upstream, base_url, 1)}
+                for interface in body.get("supportedInterfaces", [])
+                if interface.get("protocolBinding") == "JSONRPC"  # the gateway exposes JSON-RPC only
+            ]
+            if token_service:
+                body.setdefault("capabilities", {})["extensions"] = [{"uri": A2A_EXTENSION_URI, "required": False}]
+            return JSONResponse(body)
+
+        async def metadata(request: Request) -> Response:
+            if not token_service:
+                return Response(status_code=404)
+            resource = f"{base_url}/{request.path_params['path']}"
+            return JSONResponse({"resource": resource, "mcp_extensions": {MCP_EXTENSION_ID: {}}})
+
+        async def forward(request: Request) -> Response:
+            headers = _gateway_headers(request, token_service=token_service, hop=hop, a2a=a2a)
+            if headers is None:
+                return Response(status_code=401)
+            async with httpx.AsyncClient(timeout=30) as http:
+                response = await http.request(
+                    request.method,
+                    f"{upstream}{request.url.path}",
+                    params=request.query_params,
+                    headers=headers,
+                    content=await request.body(),
+                )
+            kept = {name: value for name, value in response.headers.items() if name not in _HOP_HEADERS}
+            return Response(response.content, status_code=response.status_code, headers=kept)
+
+        methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        return Starlette(
+            routes=[
+                Route("/.well-known/agent-card.json", card),
+                Route("/.well-known/oauth-protected-resource/{path:path}", metadata),
+                Route("/{path:path}", forward, methods=methods),
+            ]
+        )
 
     return factory
 
