@@ -47,6 +47,7 @@ if MCP_MAJOR < 2:
 SAMPLE = Path(__file__).parents[1] / "examples" / "sample_a2a_agent" / "agent.py"
 ASK = new_text_part("hi")
 CALL_TOOL = new_data_part({"mcp_tool": "echo"})
+UNREACHABLE = "http://127.0.0.1:1"
 
 
 def load_sample() -> ModuleType:
@@ -78,15 +79,21 @@ async def start(stack: contextlib.AsyncExitStack, *, gateways: bool = True, midd
         agent = await stack.enter_async_context(serve(fake_gateway(agent, token_service=True, hop="gw2")))
         mcp = await stack.enter_async_context(serve(fake_gateway(mcp, token_service=True, hop="gw3", a2a=False)))
 
-    def sample_app(base_url: str) -> Any:
-        config = sample.Config(public_url=base_url, target_mcp_url=f"{mcp}/mcp", target_agent_url=agent)
+    agent_url = await stack.enter_async_context(serve(sample_app(agent, f"{mcp}/mcp", middleware=middleware)))
+    return await stack.enter_async_context(serve(fake_gateway(agent_url, token_service=True, hop="gw1")))
+
+
+def sample_app(agent: str, mcp: str = UNREACHABLE, *, middleware: bool = True) -> Any:
+    """An app factory for the sample agent with the given targets."""
+
+    def factory(base_url: str) -> Any:
+        config = sample.Config(public_url=base_url, target_mcp_url=mcp, target_agent_url=agent)
         app = sample.build_app(config)
         if not middleware:
             app.user_middleware.clear()
         return app
 
-    agent_url = await stack.enter_async_context(serve(sample_app))
-    return await stack.enter_async_context(serve(fake_gateway(agent_url, token_service=True, hop="gw1")))
+    return factory
 
 
 async def send(gateway: str, part: Part) -> Task:
@@ -131,3 +138,25 @@ async def test_gateways_refuse_without_middleware(stack: contextlib.AsyncExitSta
     gateway = await start(stack, middleware=False)
     task = await send(gateway, part)
     assert task.status.state == TaskState.TASK_STATE_FAILED
+
+
+async def test_mcp_tool_error_fails_the_task(stack: contextlib.AsyncExitStack) -> None:
+    gateway = await start(stack)
+    task = await send(gateway, new_data_part({"mcp_tool": "missing"}))
+    assert task.status.state == TaskState.TASK_STATE_FAILED
+
+
+@pytest.mark.parametrize(
+    ("reachable", "state"),
+    [(True, TaskState.TASK_STATE_COMPLETED), (False, TaskState.TASK_STATE_FAILED)],
+    ids=["completed", "failed"],
+)
+async def test_relay_keeps_the_target_task_state(
+    stack: contextlib.AsyncExitStack, reachable: bool, state: TaskState
+) -> None:
+    """Sample agent -> sample agent -> A2A agent. The inner one fails when its target is unreachable."""
+    target = await stack.enter_async_context(serve(a2a_agent(announce=False))) if reachable else UNREACHABLE
+    inner = await stack.enter_async_context(serve(sample_app(target)))
+    outer = await stack.enter_async_context(serve(sample_app(inner)))
+    task = await send(outer, ASK)
+    assert task.status.state == state, task
