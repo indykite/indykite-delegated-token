@@ -26,6 +26,8 @@ Environment:
     TARGET_MCP_URL          MCP endpoint that the agent calls, through its gateway
     TARGET_AGENT_URL        base URL of the A2A agent that the agent calls, through its gateway
     PUBLIC_URL              base URL of this agent in its card (default http://localhost:<PORT>)
+    ALLOW_HTTP              set to 1 to also send the token over plain HTTP, such as to a gateway in a private
+                            network (default: https only)
     HOST, PORT              where this agent listens (default 0.0.0.0:8000)
 """
 
@@ -36,6 +38,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -66,6 +69,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 
+from indykite_delegated_token.client import ExtensionRegistry
 from indykite_delegated_token.client.a2a import DelegatedTokenInterceptor
 from indykite_delegated_token.client.httpx2 import http_client
 from indykite_delegated_token.server.asgi import DelegatedTokenASGIMiddleware
@@ -80,25 +84,27 @@ class Config:
     public_url: str
     target_mcp_url: str
     target_agent_url: str
+    allow_http: bool
 
     @classmethod
     def from_env(cls) -> Config:
         port = os.environ.get("PORT", "8000")
         return cls(
-            public_url=os.environ.get("PUBLIC_URL", f"http://localhost:{port}"),
+            public_url=os.environ.get("PUBLIC_URL", f"http://localhost:{port}").rstrip("/"),
             target_mcp_url=os.environ["TARGET_MCP_URL"],
             target_agent_url=os.environ["TARGET_AGENT_URL"],
+            allow_http=os.environ.get("ALLOW_HTTP") == "1",
         )
 
 
-async def call_mcp_tool(url: str, tool: str, arguments: dict[str, Any]) -> str:
+async def call_mcp_tool(url: str, tool: str, arguments: dict[str, Any], registry: ExtensionRegistry) -> str:
     """Call a tool of the MCP server at ``url`` and return its text output. Raises if the tool returns an error.
 
     It opens a session per call to stay simple. A long-lived ``http_client()`` is safe too: it reads the token per
     request.
     """
     async with (
-        http_client() as client,  # adds X-IK-Token if the target announces
+        http_client(registry=registry) as client,  # adds X-IK-Token if the target announces
         streamable_http_client(url, http_client=client) as (read, write),
         ClientSession(read, write) as session,
     ):
@@ -110,14 +116,25 @@ async def call_mcp_tool(url: str, tool: str, arguments: dict[str, Any]) -> str:
     return text
 
 
-async def ask_agent(url: str, text: str) -> str:
+def require_same_origin(card: AgentCard, url: str) -> None:
+    """Raises if the card lists an interface on another origin than ``url``, so the token goes only to the target."""
+    expected = urlsplit(url)
+    for interface in card.supported_interfaces:
+        actual = urlsplit(interface.url)
+        if (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc):
+            raise ValueError(f"the target's card lists an interface on another origin: {interface.url}")
+
+
+async def ask_agent(url: str, text: str, allow_http: bool) -> str:
     """Send a message to the A2A agent at ``url`` and return its text reply. Raises if its task does not complete."""
     # A target that requires its own credentials would get them here, e.g. httpx.AsyncClient(headers=...)
     async with httpx.AsyncClient(timeout=60) as http:
         card = await A2ACardResolver(http, url).get_agent_card()
+        require_same_origin(card, url)
         client = ClientFactory(ClientConfig(streaming=False, httpx_client=http)).create(
             card,
-            interceptors=[DelegatedTokenInterceptor()],  # adds X-IK-Token if the card lists the extension
+            # adds X-IK-Token if the card lists the extension
+            interceptors=[DelegatedTokenInterceptor(allow_http=allow_http)],
         )
         request = SendMessageRequest(
             message=Message(role=ROLE_USER, message_id=str(uuid.uuid4()), parts=[Part(text=text)])
@@ -151,6 +168,7 @@ class RelayExecutor(AgentExecutor):
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.registry = ExtensionRegistry(allow_http=config.allow_http)  # one for the process, so answers are cached
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         task_id, context_id = context.task_id or "", context.context_id or ""
@@ -171,8 +189,9 @@ class RelayExecutor(AgentExecutor):
             raise ValueError("no message")
         call = mcp_call(message)
         if call is not None:
-            return await call_mcp_tool(self.config.target_mcp_url, call["mcp_tool"], call.get("arguments") or {})
-        return await ask_agent(self.config.target_agent_url, get_message_text(message))
+            arguments = call.get("arguments") or {}
+            return await call_mcp_tool(self.config.target_mcp_url, call["mcp_tool"], arguments, self.registry)
+        return await ask_agent(self.config.target_agent_url, get_message_text(message), self.config.allow_http)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise NotImplementedError
