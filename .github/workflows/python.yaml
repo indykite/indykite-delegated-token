@@ -93,3 +93,48 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: python
           files: python/coverage.xml
+
+  frameworks:
+    name: Frameworks (Python ${{ matrix.python-version }}, ${{ matrix.frameworks }})
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # each group of agent frameworks runs with the MCP SDK it uses
+        frameworks: [frameworks-mcp1, frameworks-mcp2, frameworks-crewai]
+        include:
+          - frameworks: frameworks-mcp1
+            sdk: mcp1
+          - frameworks: frameworks-mcp2
+            sdk: mcp2
+          - frameworks: frameworks-crewai
+            sdk: mcp1
+        exclude:
+          # CrewAI does not support Python 3.14
+          - frameworks: frameworks-crewai
+            python-version: "3.14"
+    steps:
+      - name: actions/checkout
+        uses: indykite/.github/.github/actions/git-checkout@master # actions/checkout with dynamic fetch-depth resolution
+
+      - name: setup/uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3 - https://github.com/astral-sh/setup-uv/releases
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked --no-default-groups --group dev --group ${{ matrix.sdk }} --group ${{ matrix.frameworks }}
+
+      - name: Run framework tests
+        run: uv run --no-sync pytest tests/frameworks --cov --cov-report xml
+
+      - name: codecov/upload-coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1 - https://github.com/codecov/codecov-action/releases
+        if: matrix.python-version == '3.13'
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: python
+          files: python/coverage.xml

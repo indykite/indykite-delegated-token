@@ -64,9 +64,11 @@ async def _buffer(response: httpx2.Response, limit: int, deadline: float) -> tup
     return copy, complete
 
 
-def _with_header(request: httpx2.Request, name: str, value: str) -> httpx2.Request:
+def _with_header(request: httpx2.Request, name: str, value: str | None) -> httpx2.Request:
     headers = request.headers.copy()
-    headers[name] = value
+    headers.pop(name, None)
+    if value is not None:
+        headers[name] = value
     return httpx2.Request(
         request.method, request.url, headers=headers, stream=request.stream, extensions=request.extensions
     )
@@ -75,8 +77,9 @@ def _with_header(request: httpx2.Request, name: str, value: str) -> httpx2.Reque
 class DelegatedTokenTransport(WrappingTransport, httpx2.AsyncBaseTransport):
     """Adds ``X-IK-Token`` to the requests for targets that announce the delegated token extension.
 
-    The token is the one of the request being handled (:func:`get_delegated_token`). Requests without a token, and
-    requests to targets that do not announce, go out unchanged. A header the caller set is never replaced.
+    The token is the one the caller set in ``X-IK-Token``, or else the one of the request being handled
+    (:func:`get_delegated_token`). Requests to targets that do not announce go out without ``X-IK-Token``, also when
+    the caller set it.
     """
 
     _transport: httpx2.AsyncBaseTransport

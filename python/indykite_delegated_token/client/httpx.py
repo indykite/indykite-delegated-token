@@ -20,20 +20,30 @@ transport with :class:`DelegatedTokenTransport`.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import httpx
 
-from indykite_delegated_token.client._discovery import DEFAULT_REGISTRY, ExtensionRegistry
+from indykite_delegated_token.client._discovery import DEFAULT_REGISTRY, ExtensionRegistry, same_origin
 from indykite_delegated_token.client._transport_core import (
     METADATA_HEADERS,
     Replay,
     WrappingTransport,
     environment_proxies,
     handle,
+    in_chain,
     metadata_timeout,
     read_raw,
+    sending,
 )
 
-__all__ = ["DelegatedTokenTransport", "http_client", "httpx_client_factory"]
+__all__ = [
+    "DelegatedTokenTransport",
+    "http_client",
+    "httpx_client_factory",
+    "install_globally",
+    "uninstall_globally",
+]
 
 # The MCP SDK's defaults: a server may hold a response stream open for a long time
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, read=300.0)
@@ -61,9 +71,11 @@ async def _buffer(response: httpx.Response, limit: int, deadline: float) -> tupl
     return copy, complete
 
 
-def _with_header(request: httpx.Request, name: str, value: str) -> httpx.Request:
+def _with_header(request: httpx.Request, name: str, value: str | None) -> httpx.Request:
     headers = request.headers.copy()
-    headers[name] = value
+    headers.pop(name, None)
+    if value is not None:
+        headers[name] = value
     return httpx.Request(
         request.method, request.url, headers=headers, stream=request.stream, extensions=request.extensions
     )
@@ -72,8 +84,9 @@ def _with_header(request: httpx.Request, name: str, value: str) -> httpx.Request
 class DelegatedTokenTransport(WrappingTransport, httpx.AsyncBaseTransport):
     """Adds ``X-IK-Token`` to the requests for targets that announce the delegated token extension.
 
-    The token is the one of the request being handled (:func:`get_delegated_token`). Requests without a token, and
-    requests to targets that do not announce, go out unchanged. A header the caller set is never replaced.
+    The token is the one the caller set in ``X-IK-Token``, or else the one of the request being handled
+    (:func:`get_delegated_token`). Requests to targets that do not announce go out without ``X-IK-Token``, also when
+    the caller set it.
     """
 
     _transport: httpx.AsyncBaseTransport
@@ -134,3 +147,74 @@ def http_client(
 
 # Alias of `http_client` for the `httpx_client_factory` parameters of the MCP SDK and FastMCP
 httpx_client_factory = http_client
+
+
+# The method that install_globally() wraps
+_ORIGINAL_HANDLE = httpx.AsyncHTTPTransport.handle_async_request
+# Request extension that marks a redirect chain started at an unlisted origin. The client copies it into redirects.
+_UNLISTED = "indykite_delegated_token.unlisted"
+
+
+class _GlobalHook:
+    """What install_globally() was given."""
+
+    def __init__(self) -> None:
+        self.gateways: tuple[str, ...] = ()
+        self.registry: ExtensionRegistry = DEFAULT_REGISTRY
+
+    def listed(self, url: str) -> bool:
+        return any(same_origin(gateway, url) for gateway in self.gateways)
+
+
+_hook = _GlobalHook()
+
+
+def _skipped(request: httpx.Request) -> bool:
+    if sending():
+        return True
+    # Redirects of a handled chain come back here too: the token must not follow them to another origin
+    if in_chain(request):
+        return False
+    # A chain started at an unlisted origin stays untouched, also after a redirect to a listed one
+    if request.extensions.get(_UNLISTED) or not _hook.listed(str(request.url)):
+        request.extensions[_UNLISTED] = True
+        return True
+    return False
+
+
+async def _global_handle(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+    if _skipped(request):
+        return await _ORIGINAL_HANDLE(self, request)
+
+    async def send(outgoing: httpx.Request) -> httpx.Response:
+        return await _ORIGINAL_HANDLE(self, outgoing)
+
+    return await handle(
+        request,
+        send=send,
+        make_get=_plain_get,
+        with_header=_with_header,
+        buffer=_buffer,
+        registry=_hook.registry,
+    )
+
+
+def install_globally(gateways: Sequence[str], *, registry: ExtensionRegistry | None = None) -> None:
+    """Add the delegated token to requests of every ``httpx.AsyncClient`` of the process to the listed gateways.
+
+    For frameworks that do not let code hand over an HTTP client, such as CrewAI. ``gateways`` are origins
+    (scheme, host, port). A request to any other origin is left untouched, with no discovery fetch, so the token
+    never reaches the LLM provider. Its redirects stay untouched too, also to a listed origin. Requests to a listed
+    origin go through the same logic as :class:`DelegatedTokenTransport`: the token goes only to targets that
+    announce the extension. Calling it again replaces the list. :func:`uninstall_globally` undoes it.
+    """
+    _hook.gateways = tuple(gateways)
+    _hook.registry = registry if registry is not None else DEFAULT_REGISTRY
+    httpx.AsyncHTTPTransport.handle_async_request = _global_handle  # type: ignore[method-assign]
+
+
+def uninstall_globally() -> None:
+    """Undo :func:`install_globally`."""
+    _hook.gateways = ()
+    _hook.registry = DEFAULT_REGISTRY
+    httpx.AsyncHTTPTransport.handle_async_request = _ORIGINAL_HANDLE  # type: ignore[method-assign]

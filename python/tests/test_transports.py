@@ -112,8 +112,9 @@ async def test_not_announced_target_gets_nothing(lib: tuple[ModuleType, ModuleTy
 
 
 @pytest.mark.parametrize(("allow_http", "expected"), [(False, None), (True, "tok")])
+@pytest.mark.parametrize("headers", [{}, {"X-IK-Token": "tok"}], ids=["context", "caller"])
 async def test_plain_http_needs_allow_http(
-    lib: tuple[ModuleType, ModuleType], allow_http: bool, expected: str | None
+    lib: tuple[ModuleType, ModuleType], allow_http: bool, expected: str | None, headers: dict[str, str]
 ) -> None:
     http, adapter = lib
     url, urls = "http://mcp.example.com/mcp", []
@@ -127,17 +128,62 @@ async def test_plain_http_needs_allow_http(
     registry = ExtensionRegistry(allow_http=allow_http)
     async with adapter.http_client(transport=http.MockTransport(target), registry=registry) as c:
         with use_token("tok"):
-            response = await c.post(url, content=b"{}")
+            response = await c.post(url, content=b"{}", headers=headers)
     assert response.json() == {"seen": expected}
     assert len(urls) == (2 if allow_http else 1)  # without allow_http, not even the metadata is fetched
 
 
-async def test_caller_header_is_kept(lib: tuple[ModuleType, ModuleType]) -> None:
+@pytest.mark.parametrize("context_token", ["tok", None], ids=["with-context", "without-context"])
+async def test_caller_header_wins_for_announced_target(
+    lib: tuple[ModuleType, ModuleType], context_token: str | None
+) -> None:
     target = Target()
     async with client(lib, target) as c:
-        with use_token("tok"):
+        with use_token(context_token):
             response = await c.post(TARGET, content=b"{}", headers={"X-IK-Token": "caller"})
     assert response.json() == {"seen": "caller"}
+    assert len(target.metadata_requests()) == 1
+
+
+@pytest.mark.parametrize("context_token", ["tok", None], ids=["with-context", "without-context"])
+async def test_caller_header_is_removed_for_silent_target(
+    lib: tuple[ModuleType, ModuleType], context_token: str | None
+) -> None:
+    target = Target(announced=False)
+    async with client(lib, target) as c:
+        with use_token(context_token):
+            response = await c.post(TARGET, content=b"{}", headers={"X-IK-Token": "caller"})
+    assert response.json() == {"seen": None}
+
+
+async def test_caller_header_is_removed_on_redirect_to_other_origin(lib: tuple[ModuleType, ModuleType]) -> None:
+    http, _ = lib
+    seen: dict[str, str | None] = {}
+    location = "https://evil.example.com/steal"
+
+    def answer(request: Any) -> Any:
+        url = str(request.url)
+        seen[url] = request.headers.get("X-IK-Token")
+        if url == METADATA:
+            return http.Response(200, json={"resource": TARGET, "mcp_extensions": {MCP_EXTENSION_ID: {}}})
+        if url == TARGET:
+            return http.Response(307, headers={"Location": location})
+        return http.Response(200)
+
+    async with client(lib, answer, follow_redirects=True) as c:  # type: ignore[arg-type]
+        await c.post(TARGET, content=b"{}", headers={"X-IK-Token": "caller"})
+    assert seen[TARGET] == "caller"
+    assert seen[location] is None
+    assert METADATA in seen
+    assert "https://evil.example.com/.well-known/oauth-protected-resource/steal" not in seen
+
+
+async def test_caller_header_is_retried_after_401(lib: tuple[ModuleType, ModuleType]) -> None:
+    target = Target(challenge=f'Bearer resource_metadata="{LINK}"')
+    async with client(lib, target) as c:
+        response = await c.post(TARGET, content=b"{}", headers={"X-IK-Token": "caller"})
+    assert response.json() == {"seen": "caller"}
+    assert [call.headers.get("x-ik-token") for call in target.calls()] == [None, "caller"]
 
 
 async def test_401_link_is_followed_and_retried_once(lib: tuple[ModuleType, ModuleType]) -> None:

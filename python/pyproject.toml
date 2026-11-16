@@ -68,12 +68,43 @@ mcp2 = [
     "fastmcp>=4",
     "mcp>=2.3",
 ]
+# Agent frameworks, split by the MCP SDK they use; each is tested together with its `mcp*` group
+frameworks-mcp1 = [
+    "agent-framework-core>=1.0.1,<1.23",
+    "google-adk>=2.14",
+    "langchain-mcp-adapters>=0.3",
+    "langgraph>=1",
+    "openai-agents>=0.24",
+]
+# CrewAI needs openai 2.x and openai-agents openai 3.x, so CrewAI has an environment of its own
+frameworks-crewai = [
+    "crewai>=1.15; python_version < '3.14'",
+]
+frameworks-mcp2 = [
+    "agent-framework-core>=1.23",
+    "google-adk>=2.14",
+    "llama-index-core",
+    "llama-index-tools-mcp>=0.7",
+    "openai-agents>=0.24",
+    "pydantic-ai-slim[fastmcp]>=2.68",
+]
 
 [tool.uv]
 # `uv run pytest` tests against mcp 2.x; `uv run --no-group mcp2 --group mcp1 pytest` against mcp 1.x
 default-groups = ["dev", "mcp2"]
 conflicts = [
     [{ group = "mcp1" }, { group = "mcp2" }],
+    [{ group = "frameworks-mcp1" }, { group = "frameworks-mcp2" }],
+    [{ group = "frameworks-mcp1" }, { group = "mcp2" }],
+    [{ group = "frameworks-mcp2" }, { group = "mcp1" }],
+    [{ group = "frameworks-mcp1" }, { extra = "mcp" }],
+    [{ group = "frameworks-mcp1" }, { extra = "fastmcp" }],
+    [{ group = "frameworks-mcp2" }, { extra = "mcp1" }],
+    [{ group = "frameworks-crewai" }, { group = "frameworks-mcp1" }],
+    [{ group = "frameworks-crewai" }, { group = "frameworks-mcp2" }],
+    [{ group = "frameworks-crewai" }, { group = "mcp2" }],
+    [{ group = "frameworks-crewai" }, { extra = "mcp" }],
+    [{ group = "frameworks-crewai" }, { extra = "fastmcp" }],
     [{ extra = "mcp1" }, { extra = "mcp" }],
     [{ extra = "mcp1" }, { extra = "fastmcp" }],
     [{ extra = "mcp1" }, { group = "mcp2" }],
@@ -89,6 +120,7 @@ indykite_delegated_token = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
@@ -102,11 +134,44 @@ omit = [
 strict = true
 python_version = "3.11"
 files = ["indykite_delegated_token", "tests"]
+mypy_path = "tests"
 
 [[tool.mypy.overrides]]
 # the tests register tools through the untyped decorators of the SDKs
 module = ["_harness", "test_asgi", "test_install", "test_propagation"]
 disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+# agent frameworks: untyped, or not installed in the environment being checked
+module = [
+    "agent_framework.*",
+    "agents.*",
+    "crewai.*",
+    "google.adk.*",
+    "google.genai.*",
+    "langchain_core.*",
+    "langchain_mcp_adapters.*",
+    "langgraph.*",
+    "llama_index.*",
+    "openai.*",
+    "pydantic_ai.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# the framework tests subclass framework types, which are untyped where the framework is not installed
+module = [
+    "test_adk",
+    "test_agent_framework",
+    "test_crewai",
+    "test_langchain",
+    "test_llama_index",
+    "test_openai_agents",
+    "test_pydantic_ai",
+]
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+warn_unused_ignores = false
 
 #
 # 'ruff' - the linter and formatter
