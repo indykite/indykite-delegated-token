@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 import pytest
-from _harness import serve
+from _harness import a2a_agent, ask_agent, serve
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
@@ -55,8 +55,21 @@ def app(announce: bool, redirect_to: str = "") -> Any:
 
 @pytest.fixture(autouse=True)
 def restore() -> Iterator[None]:
+    original = httpx.AsyncHTTPTransport.handle_async_request
     yield
     uninstall_globally()
+    httpx.AsyncHTTPTransport.handle_async_request = original  # type: ignore[method-assign]
+
+
+def wrap_handle(calls: list[str]) -> None:
+    """Wrap the transport's method as tracing does, recording each request's URL in ``calls``."""
+    inner = httpx.AsyncHTTPTransport.handle_async_request
+
+    async def traced(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return await inner(self, request)
+
+    httpx.AsyncHTTPTransport.handle_async_request = traced  # type: ignore[method-assign]
 
 
 @pytest.fixture
@@ -136,3 +149,53 @@ async def test_redirect_from_unlisted_origin_gets_no_token(servers: tuple[str, s
         with use_token("tok"):
             seen = await post(f"{unlisted}/redirect", follow=True)
     assert seen is None
+
+
+async def test_wrapper_installed_before_is_kept(servers: tuple[str, str]) -> None:
+    announcing, _ = servers
+    calls: list[str] = []
+    wrap_handle(calls)
+    install_globally([announcing], registry=ExtensionRegistry())
+    with use_token("tok"):
+        assert await post(f"{announcing}/mcp") == "tok"
+    uninstall_globally()
+    await post(f"{announcing}/mcp")
+    assert calls[-1] == f"{announcing}/mcp"
+    assert len(calls) == 3  # metadata, call, call after uninstall
+
+
+async def test_wrapper_installed_after_is_kept(servers: tuple[str, str]) -> None:
+    announcing, _ = servers
+    calls: list[str] = []
+    install_globally([announcing], registry=ExtensionRegistry())
+    install_globally([announcing], registry=ExtensionRegistry())  # again: must not wrap itself
+    wrap_handle(calls)
+    with use_token("tok"):
+        assert await post(f"{announcing}/mcp") == "tok"
+    uninstall_globally()
+    with use_token("tok"):
+        assert await post(f"{announcing}/mcp") is None  # the hook stays under the newer wrapper, with no gateway
+    assert len(calls) == 2
+
+
+async def test_a2a_call_is_left_to_interceptor() -> None:
+    pytest.importorskip("a2a")
+    async with serve(a2a_agent(True)) as agent:
+        install_globally([agent], registry=ExtensionRegistry())
+        with use_token("tok"):
+            seen = await ask_agent(agent)
+    assert seen["token"] == "tok"
+
+
+@pytest.mark.parametrize(
+    ("gateways", "error"),
+    [
+        ("https://gateway.example.com", TypeError),
+        (["gateway.example.com"], ValueError),
+        (["ftp://gateway.example.com"], ValueError),
+        (["https://"], ValueError),
+    ],
+)
+def test_invalid_gateways(gateways: Any, error: type[Exception]) -> None:
+    with pytest.raises(error):
+        install_globally(gateways)

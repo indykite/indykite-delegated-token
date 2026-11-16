@@ -297,7 +297,9 @@ install_globally(gateways=["https://gateway.example.com"])
 
 Only requests to the listed origins (scheme, host, port) are handled, so the token never reaches the LLM provider.
 They still get the token only if their target announces the extension. A request to another origin stays untouched,
-also when it is redirected to a listed origin. `uninstall_globally()` undoes it. Not
+also when it is redirected to a listed origin. A2A calls that `DelegatedTokenInterceptor` marked with the extension
+are left to the interceptor. `uninstall_globally()` undoes it. Leave `cache_tools_list` off: CrewAI caches the tool
+list per URL for the whole process, so one user would get another's tools. Not
 supported: `MCPServerAdapter` of `crewai-tools`, whose session runs in its own thread, and tools written as plain
 functions that CrewAI runs in a thread without the request's context.
 

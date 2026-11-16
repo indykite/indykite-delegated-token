@@ -21,9 +21,11 @@ transport with :class:`DelegatedTokenTransport`.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from urllib.parse import urlsplit
 
 import httpx
 
+from indykite_delegated_token._constants import A2A_EXTENSION_URI, A2A_EXTENSIONS_HEADER
 from indykite_delegated_token.client._discovery import DEFAULT_REGISTRY, ExtensionRegistry, same_origin
 from indykite_delegated_token.client._transport_core import (
     METADATA_HEADERS,
@@ -149,8 +151,6 @@ def http_client(
 httpx_client_factory = http_client
 
 
-# The method that install_globally() wraps
-_ORIGINAL_HANDLE = httpx.AsyncHTTPTransport.handle_async_request
 # Request extension that marks a redirect chain started at an unlisted origin. The client copies it into redirects.
 _UNLISTED = "indykite_delegated_token.unlisted"
 
@@ -161,6 +161,8 @@ class _GlobalHook:
     def __init__(self) -> None:
         self.gateways: tuple[str, ...] = ()
         self.registry: ExtensionRegistry = DEFAULT_REGISTRY
+        # The method install_globally() replaced, which may itself wrap httpx's, for example for tracing
+        self.wrapped = httpx.AsyncHTTPTransport.handle_async_request
 
     def listed(self, url: str) -> bool:
         return any(same_origin(gateway, url) for gateway in self.gateways)
@@ -171,6 +173,9 @@ _hook = _GlobalHook()
 
 def _skipped(request: httpx.Request) -> bool:
     if sending():
+        return True
+    # An A2A call that DelegatedTokenInterceptor already checked against the agent's card
+    if A2A_EXTENSION_URI in request.headers.get_list(A2A_EXTENSIONS_HEADER, split_commas=True):
         return True
     # Redirects of a handled chain come back here too: the token must not follow them to another origin
     if in_chain(request):
@@ -184,10 +189,10 @@ def _skipped(request: httpx.Request) -> bool:
 
 async def _global_handle(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
     if _skipped(request):
-        return await _ORIGINAL_HANDLE(self, request)
+        return await _hook.wrapped(self, request)
 
     async def send(outgoing: httpx.Request) -> httpx.Response:
-        return await _ORIGINAL_HANDLE(self, outgoing)
+        return await _hook.wrapped(self, outgoing)
 
     return await handle(
         request,
@@ -206,15 +211,31 @@ def install_globally(gateways: Sequence[str], *, registry: ExtensionRegistry | N
     (scheme, host, port). A request to any other origin is left untouched, with no discovery fetch, so the token
     never reaches the LLM provider. Its redirects stay untouched too, also to a listed origin. Requests to a listed
     origin go through the same logic as :class:`DelegatedTokenTransport`: the token goes only to targets that
-    announce the extension. Calling it again replaces the list. :func:`uninstall_globally` undoes it.
+    announce the extension. A2A calls that :class:`~indykite_delegated_token.client.a2a.DelegatedTokenInterceptor`
+    marked with the extension are left to it. Calling it again replaces the list. :func:`uninstall_globally` undoes
+    it.
+
+    Raises :class:`TypeError` for a single string, and :class:`ValueError` for an entry that is not an ``http`` or
+    ``https`` URL with a host.
     """
+    if isinstance(gateways, str):
+        raise TypeError("gateways must be a list of origins, not a string")
+    for gateway in gateways:
+        parts = urlsplit(gateway)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(f"not an origin: {gateway!r}")
     _hook.gateways = tuple(gateways)
     _hook.registry = registry if registry is not None else DEFAULT_REGISTRY
-    httpx.AsyncHTTPTransport.handle_async_request = _global_handle  # type: ignore[method-assign]
+    current = httpx.AsyncHTTPTransport.handle_async_request
+    if current is not _global_handle:  # wrap what is there now, such as OpenTelemetry's instrumentation
+        _hook.wrapped = current
+        httpx.AsyncHTTPTransport.handle_async_request = _global_handle  # type: ignore[method-assign]
 
 
 def uninstall_globally() -> None:
     """Undo :func:`install_globally`."""
     _hook.gateways = ()
     _hook.registry = DEFAULT_REGISTRY
-    httpx.AsyncHTTPTransport.handle_async_request = _ORIGINAL_HANDLE  # type: ignore[method-assign]
+    # Restore only if nobody wrapped the method since: undoing it would remove their wrapper too
+    if httpx.AsyncHTTPTransport.handle_async_request is _global_handle:
+        httpx.AsyncHTTPTransport.handle_async_request = _hook.wrapped  # type: ignore[method-assign]
