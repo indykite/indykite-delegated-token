@@ -12,7 +12,8 @@ call must carry the token too, or the gateway refuses it. This package does both
 - **server side**: `install(server)` for MCP servers, or an ASGI middleware for A2A agents, makes the token of the
   request being handled available through `get_delegated_token()`;
 - **client side**: an HTTP client for MCP calls and an interceptor for A2A calls send it on, to the targets that
-  announce the delegated token extension and to no others.
+  announce the delegated token extension and to no others. Agent frameworks use the same clients, see
+  [Agent frameworks](#agent-frameworks).
 
 ## Installation
 
@@ -165,7 +166,8 @@ client = ClientFactory(config).create(card, interceptors=[DelegatedTokenIntercep
 
 The interceptor works with every A2A transport. For an agent whose card lists the extension
 `https://indykite.com/extensions/delegated-token/v1` in `capabilities.extensions`, it sets `X-IK-Token` and adds the
-extension to `A2A-Extensions`. Other agents get neither.
+extension to `A2A-Extensions`. Other agents get neither; an `X-IK-Token` the caller set in the call's service
+parameters is removed for them.
 
 > [!IMPORTANT]
 > **MCP SDK 1.x clients must be opened inside the tool call.** The 1.x client sends its requests from a task started
@@ -174,7 +176,8 @@ extension to `A2A-Extensions`. Other agents get neither.
 
 ### Which targets get the token
 
-A request carries `X-IK-Token` only when there is a token and the target announced the extension:
+A request carries `X-IK-Token` only when there is a token and the target announced the extension, whoever set the
+token: the package from the request being handled, the developer, or a framework's header hook.
 
 - **MCP targets** announce in their OAuth protected resource metadata (RFC 9728): `mcp_extensions` contains
   `com.indykite/delegated-token`, and `resource` is the target's URL. Before the first request to a target, the
@@ -197,7 +200,9 @@ A request carries `X-IK-Token` only when there is a token and the target announc
   HTTP anyone on the network could read it, or forge the metadata that announces the extension. To send it over plain
   HTTP anyway, for example inside a private network, pass `registry=ExtensionRegistry(allow_http=True)` to the MCP
   client, and `allow_http=True` to `DelegatedTokenInterceptor`.
-- A token the caller set itself is never replaced.
+- A token the caller set itself in `X-IK-Token` goes out as set, but follows the same rules: a target that does not
+  announce, another origin after a redirect, or plain HTTP without `allow_http`, never gets it. The header is removed
+  from those requests.
 - When the client follows redirects, the token only goes to the origin of the first request: a redirect to another
   origin, or from `https` to `http`, never gets it, even if its target announces.
 - The cache is shared by every client of the process. Clients that reach the same URL through different network
@@ -207,6 +212,142 @@ A request carries `X-IK-Token` only when there is a token and the target announc
 > Announcing the extension does not make a target trustworthy: anyone can announce it, and every target that does
 > receives the token. Call only targets that your server's operator configured, such as `TARGET_MCP_URL` in the
 > examples, never a URL that comes from the tool's caller or from a model.
+
+### Agent frameworks
+
+Agent frameworks send the token on through the same HTTP clients. Two rules apply to all of them:
+
+- **Open the MCP client, toolset or server inside the request**, never at startup, and do not share it between
+  requests. The gateway lists tools only for a token, filtered for its user. A session kept across requests would
+  list one user's tools for another, and on MCP SDK 1.x send the first user's token.
+- **Use `client.httpx` with frameworks on MCP SDK 1.x and `client.httpx2` with those on 2.x**, as for the MCP SDK
+  itself. A wrong choice fails: the framework rejects the client.
+
+| Framework                                          | MCP SDK                       | Hook                                                                          |
+| -------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------------- |
+| LangChain MCP adapters 0.3, LangGraph              | 1.x                           | `httpx_client_factory`; on the LangGraph server, also `token_from_run_config` |
+| CrewAI 1.15, native `mcps=`                        | 1.x                           | `install_globally(gateways=[...])`                                            |
+| Google ADK 2.14, `McpToolset`                      | 1.x, 2.x                      | `httpx_client_factory` and `header_provider`                                  |
+| OpenAI Agents SDK 0.24, `MCPServerStreamableHttp`  | 1.x, 2.x                      | `httpx_client_factory`                                                        |
+| Pydantic AI 2.68, `MCPToolset`                     | 2.x                           | `http_client`                                                                 |
+| LlamaIndex MCP tools 0.7, `BasicMCPClient`         | 2.x                           | `http_client`                                                                 |
+| Microsoft Agent Framework, `MCPStreamableHTTPTool` | 1.x up to 1.22, 2.x from 1.23 | `http_client`                                                                 |
+
+**LangChain / LangGraph** - the adapters open a session per tool call:
+
+```python
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+from indykite_delegated_token.client.httpx import http_client
+from indykite_delegated_token.integrations.langchain import token_from_run_config
+
+client = MultiServerMCPClient(
+    {"target": {"url": TARGET_MCP_URL, "transport": "streamable_http", "httpx_client_factory": http_client}},
+    tool_interceptors=[token_from_run_config],  # LangGraph server only
+)
+tools = await client.get_tools()  # inside the request
+```
+
+On the LangGraph server a run executes in a queue worker, outside the HTTP request. List `X-IK-Token` in the
+deployment's setting for headers copied into the run configuration. The token is then needed twice:
+
+- to list the tools, which happens before any tool call: build the graph for each run, and wrap the listing in
+  `use_token(run_config_token(config))`;
+- for each tool call, which runs outside that block: `token_from_run_config` takes it from the run configuration.
+
+```python
+from langchain_core.runnables import RunnableConfig
+
+from indykite_delegated_token import use_token
+from indykite_delegated_token.integrations.langchain import run_config_token
+
+
+async def make_graph(config: RunnableConfig):  # the graph factory named in langgraph.json
+    with use_token(run_config_token(config)):
+        tools = await client.get_tools()
+    return create_agent(model, tools)
+```
+
+The token is stored with the run and may appear in traces: leave it out of tracing.
+
+**CrewAI** - CrewAI takes no HTTP client, so the package hooks `httpx` for the whole process:
+
+```python
+from indykite_delegated_token.client.httpx import install_globally
+
+install_globally(gateways=["https://gateway.example.com"])
+```
+
+Only requests to the listed origins (scheme, host, port) are handled, so the token never reaches the LLM provider.
+They still get the token only if their target announces the extension. A request to another origin stays untouched,
+also when it is redirected to a listed origin. `uninstall_globally()` undoes it. Not
+supported: `MCPServerAdapter` of `crewai-tools`, whose session runs in its own thread, and tools written as plain
+functions that CrewAI runs in a thread without the request's context.
+
+**Google ADK** - pass both the header provider and the package's client factory:
+
+```python
+from google.adk.tools.mcp_tool import McpToolset, StreamableHTTPConnectionParams
+
+from indykite_delegated_token.client.httpx2 import http_client  # client.httpx on MCP SDK 1.x
+from indykite_delegated_token.integrations.adk import header_provider
+
+toolset = McpToolset(
+    connection_params=StreamableHTTPConnectionParams(url=TARGET_MCP_URL, httpx_client_factory=http_client),
+    header_provider=header_provider,
+)
+```
+
+ADK keys its sessions on the headers, so each token gets its own session. The client factory is required: without
+it, the header goes to every server of the toolset, also to those that do not announce the extension.
+
+**OpenAI Agents SDK** - enter the server inside the request:
+
+```python
+from agents.mcp import MCPServerStreamableHttp
+
+from indykite_delegated_token.client.httpx2 import http_client  # client.httpx on MCP SDK 1.x
+
+async with MCPServerStreamableHttp(params={"url": TARGET_MCP_URL, "httpx_client_factory": http_client}) as server:
+    agent = Agent(name="agent", mcp_servers=[server])
+    ...
+```
+
+**Pydantic AI** - create the toolset inside the request:
+
+```python
+from pydantic_ai.mcp import MCPToolset
+
+from indykite_delegated_token.client.httpx2 import http_client
+
+async with http_client() as http:
+    agent = Agent(model, toolsets=[MCPToolset(TARGET_MCP_URL, http_client=http)])
+    ...
+```
+
+**LlamaIndex** - `BasicMCPClient` opens a session per call:
+
+```python
+from llama_index.tools.mcp import BasicMCPClient
+
+from indykite_delegated_token.client.httpx2 import http_client
+
+async with http_client() as http:
+    client = BasicMCPClient(TARGET_MCP_URL, http_client=http)
+    ...
+```
+
+**Microsoft Agent Framework** - enter the tool inside the request:
+
+```python
+from agent_framework import MCPStreamableHTTPTool
+
+from indykite_delegated_token.client.httpx2 import http_client  # client.httpx up to agent-framework-core 1.22
+
+async with http_client() as http, MCPStreamableHTTPTool("target", url=TARGET_MCP_URL, http_client=http) as tool:
+    agent = Agent(chat_client, tools=[tool])
+    ...
+```
 
 ### Security
 
@@ -265,6 +406,9 @@ mcp 2.x, FastMCP 4 and a2a-sdk; the tests of the other SDK are skipped.
 uv sync                            # create .venv with the package, dev tools and mcp 2.x
 uv run pytest                      # tests against mcp 2.x and FastMCP 4
 UV_PROJECT_ENVIRONMENT=.venv-mcp1 uv run --no-group mcp2 --group mcp1 pytest   # tests against mcp 1.x
+uv run --group frameworks-mcp2 pytest tests/frameworks                          # frameworks on mcp 2.x
+UV_PROJECT_ENVIRONMENT=.venv-mcp1 uv run --no-group mcp2 --group mcp1 --group frameworks-mcp1 pytest tests/frameworks
+UV_PROJECT_ENVIRONMENT=.venv-crewai uv run --python 3.13 --no-group mcp2 --group mcp1 --group frameworks-crewai pytest tests/frameworks/test_crewai.py
 uv run ruff check && uv run ruff format --check
 uv run mypy --follow-imports=silent --exclude 'server/mcp_v1\.py'
 ```
