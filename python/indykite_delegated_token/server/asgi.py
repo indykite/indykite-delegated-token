@@ -19,6 +19,8 @@ pure ASGI, not Starlette's ``BaseHTTPMiddleware``, which runs the app in another
 
 For stateful MCP sessions, the handler of a message does not run within its HTTP request; use
 :func:`indykite_delegated_token.install` on the MCP server instead.
+
+Add it as the outermost middleware: anything above it still sees the header.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
+from indykite_delegated_token._constants import DELEGATED_TOKEN_HEADER
 from indykite_delegated_token._context import token_in, use_token
 
 __all__ = ["DelegatedTokenASGIMiddleware"]
@@ -36,16 +39,36 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
+_HEADER = DELEGATED_TOKEN_HEADER.lower().encode("latin-1")
+
+
+def _without_token(scope: Scope) -> Scope:
+    # A shallow copy: the server's scope and headers list stay unchanged
+    headers = [(name, value) for name, value in scope.get("headers") or () if name.lower() != _HEADER]
+    return {**scope, "headers": headers}
+
 
 class DelegatedTokenASGIMiddleware:
-    """Runs each HTTP request with the token of its ``X-IK-Token`` header as the delegated token."""
+    """Runs each HTTP request with the token of its ``X-IK-Token`` header as the delegated token.
 
-    def __init__(self, app: ASGIApp) -> None:
+    With ``strip_header=True``, the header is also removed from the request that the app sees. The app then reaches
+    the token only through :func:`get_delegated_token`, so nothing below the middleware can log it or pass it on.
+    a2a-sdk, for example, copies all request headers into its call context and logs that context at DEBUG.
+
+    Do not set ``strip_header`` in front of an MCP server that uses :func:`indykite_delegated_token.install`: its
+    adapters read the header from the request, so they would see no token.
+    """
+
+    def __init__(self, app: ASGIApp, *, strip_header: bool = False) -> None:
         self.app = app
+        self.strip_header = strip_header
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        with use_token(token_in(scope.get("headers") or ())):
+        token = token_in(scope.get("headers") or ())
+        if self.strip_header:
+            scope = _without_token(scope)
+        with use_token(token):
             await self.app(scope, receive, send)
