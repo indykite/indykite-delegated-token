@@ -55,6 +55,7 @@ from a2a.types.a2a_pb2 import (
     Message,
     Part,
     SendMessageRequest,
+    Task,
     TaskState,
 )
 from mcp.client.session import ClientSession
@@ -91,7 +92,7 @@ class Config:
 
 
 async def call_mcp_tool(url: str, tool: str, arguments: dict[str, Any]) -> str:
-    """Call a tool of the MCP server at ``url`` and return its text output.
+    """Call a tool of the MCP server at ``url`` and return its text output. Raises if the tool returns an error.
 
     It opens a session per call to stay simple. A long-lived ``http_client()`` is safe too: it reads the token per
     request.
@@ -103,11 +104,14 @@ async def call_mcp_tool(url: str, tool: str, arguments: dict[str, Any]) -> str:
     ):
         await session.initialize()
         result = await session.call_tool(tool, arguments)
-    return "\n".join(getattr(content, "text", "") for content in result.content)
+    text = "\n".join(getattr(content, "text", "") for content in result.content)
+    if result.is_error:
+        raise RuntimeError(f"tool {tool} failed: {text}")
+    return text
 
 
 async def ask_agent(url: str, text: str) -> str:
-    """Send a message to the A2A agent at ``url`` and return its text reply."""
+    """Send a message to the A2A agent at ``url`` and return its text reply. Raises if its task does not complete."""
     # A target that requires its own credentials would get them here, e.g. httpx.AsyncClient(headers=...)
     async with httpx.AsyncClient(timeout=60) as http:
         card = await A2ACardResolver(http, url).get_agent_card()
@@ -122,9 +126,16 @@ async def ask_agent(url: str, text: str) -> str:
         async for response in client.send_message(request):
             if response.HasField("message"):
                 replies.append(get_message_text(response.message))
-            for artifact in response.task.artifacts:
-                replies.extend(part.text for part in artifact.parts)
+            if response.HasField("task"):
+                replies.extend(task_text(response.task))
     return "\n".join(replies)
+
+
+def task_text(task: Task) -> list[str]:
+    """The text of the task's artifacts. Raises if the task did not complete."""
+    if task.status.state != TaskState.TASK_STATE_COMPLETED:
+        raise RuntimeError(f"the target's task ended in {TaskState.Name(task.status.state)}")
+    return [part.text for artifact in task.artifacts for part in artifact.parts]
 
 
 def mcp_call(message: Message) -> dict[str, Any] | None:
