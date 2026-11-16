@@ -103,7 +103,7 @@ async def test_strip_header() -> None:
     await DelegatedTokenASGIMiddleware(recorder(seen), strip_header=True)(scope, noop_receive, noop_send)
 
     [(app_scope, token)] = seen
-    assert token == "tok"
+    assert token is None  # two token headers are ambiguous, so none is used
     assert app_scope["headers"] == [
         (b"accept", b"a"),
         (b"x-custom", b"1"),
