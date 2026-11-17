@@ -20,21 +20,13 @@ transport with :class:`DelegatedTokenTransport`.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 
 import httpx
 
 from indykite_delegated_token.client._discovery import DEFAULT_REGISTRY, ExtensionRegistry, same_origin
-from indykite_delegated_token.client._transport_core import (
-    METADATA_HEADERS,
-    Replay,
-    WrappingTransport,
-    handle,
-    in_chain,
-    metadata_timeout,
-    read_raw,
-    sending,
-)
+from indykite_delegated_token.client._transport_core import WrappingTransport, handle, in_chain, sending
 
 __all__ = [
     "DelegatedTokenTransport",
@@ -46,38 +38,6 @@ __all__ = [
 
 # The MCP SDK's defaults: a server may hold a response stream open for a long time
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, read=300.0)
-
-
-def _plain_get(url: str, request: httpx.Request) -> httpx.Request:
-    return httpx.Request("GET", url, headers=METADATA_HEADERS, extensions={"timeout": metadata_timeout(request)})
-
-
-class _Replay(Replay, httpx.AsyncByteStream):
-    """:class:`Replay` as an ``httpx`` stream."""
-
-
-async def _buffer(response: httpx.Response, limit: int, deadline: float) -> tuple[httpx.Response, bool]:
-    if response.is_stream_consumed:  # a body given in memory, as by a mock transport, is read already
-        return response, len(response.content) <= limit
-    # Raw bytes, before any decompression, so the limit holds; the client decodes the replayed body as usual
-    raw = response.aiter_raw()
-    try:
-        read, complete = await read_raw(response, raw, limit, deadline)
-    except TimeoutError as exc:
-        raise httpx.ReadTimeout(f"response body not read within {deadline} seconds") from exc
-    stream = _Replay(read, None if complete else raw, response)
-    copy = httpx.Response(response.status_code, headers=response.headers, stream=stream, extensions=response.extensions)
-    return copy, complete
-
-
-def _with_header(request: httpx.Request, name: str, value: str | None) -> httpx.Request:
-    headers = request.headers.copy()
-    headers.pop(name, None)
-    if value is not None:
-        headers[name] = value
-    return httpx.Request(
-        request.method, request.url, headers=headers, stream=request.stream, extensions=request.extensions
-    )
 
 
 class DelegatedTokenTransport(WrappingTransport, httpx.AsyncBaseTransport):
@@ -100,14 +60,7 @@ class DelegatedTokenTransport(WrappingTransport, httpx.AsyncBaseTransport):
         self._registry = registry if registry is not None else DEFAULT_REGISTRY
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        return await handle(
-            request,
-            send=self._transport.handle_async_request,
-            make_get=_plain_get,
-            with_header=_with_header,
-            buffer=_buffer,
-            registry=self._registry,
-        )
+        return await handle(request, send=self._transport.handle_async_request, lib=httpx, registry=self._registry)
 
 
 def http_client(
@@ -173,18 +126,7 @@ def _skipped(request: httpx.Request) -> bool:
 async def _global_handle(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
     if _skipped(request):
         return await _ORIGINAL_HANDLE(self, request)
-
-    async def send(outgoing: httpx.Request) -> httpx.Response:
-        return await _ORIGINAL_HANDLE(self, outgoing)
-
-    return await handle(
-        request,
-        send=send,
-        make_get=_plain_get,
-        with_header=_with_header,
-        buffer=_buffer,
-        registry=_hook.registry,
-    )
+    return await handle(request, send=functools.partial(_ORIGINAL_HANDLE, self), lib=httpx, registry=_hook.registry)
 
 
 def install_globally(gateways: Sequence[str], *, registry: ExtensionRegistry | None = None) -> None:
