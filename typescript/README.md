@@ -1,19 +1,18 @@
 # IndyKite delegated token - TypeScript
 
-TypeScript package for the delegated token propagation of the IndyKite Agent Gateway.
-The package contains compiled JavaScript (ES modules) and type definitions, so plain JavaScript projects use it too.
+TypeScript package (ES modules with type definitions) for the delegated token propagation of the IndyKite Agent
+Gateway.
 
 > [!WARNING]
 > Work in progress, not published to npm yet.
 
-The agent gateway in front of an MCP server sends the delegated token of the workflow in the `X-IK-Token` header.
-When a tool of that server calls another MCP server or an A2A agent through the next gateway, the call must carry the
-token too, or the gateway refuses it. This package does both halves:
+The agent gateway in front of an MCP server sends the workflow's delegated token in the `X-IK-Token` header. When a
+tool calls another MCP server or A2A agent through the next gateway, the call must carry the token too. This package
+does both halves:
 
-- **server side**: a middleware makes the token of the request being handled available to its tools, through
-  `getDelegatedToken()`;
-- **client side**: a `fetch` wrapper for MCP calls and an interceptor for A2A calls send it on, to the targets that
-  announce the delegated token extension and to no others.
+- **server side**: middleware that makes the token of the current request available through `getDelegatedToken()`;
+- **client side**: a `fetch` wrapper (MCP) and an interceptor (A2A) that send it on, only to targets that announce the
+  delegated token extension.
 
 ## Installation
 
@@ -21,8 +20,7 @@ token too, or the gateway refuses it. This package does both halves:
 npm install @indykite/delegated-token
 ```
 
-Node.js 22+ is required. The package has no dependencies. Each entry point works with the SDK or framework you
-already use:
+Node.js 22+, no dependencies.
 
 | Entry point                             | Contents                                     | Works with                       |
 | --------------------------------------- | -------------------------------------------- | -------------------------------- |
@@ -33,8 +31,8 @@ already use:
 | `@indykite/delegated-token/fetch`       | `delegatedTokenFetch()`, `redirectGuard()`   | MCP TypeScript SDK 1.x and 2.x   |
 | `@indykite/delegated-token/a2a`         | `delegatedTokenClientOptions()`              | `@a2a-js/sdk` 1.3+               |
 
-The server middlewares and the `fetch` wrapper import no SDK, so the same code works with the MCP TypeScript SDK 1.x
-(`@modelcontextprotocol/sdk`) and 2.x (`@modelcontextprotocol/server` and `@modelcontextprotocol/client`).
+The middlewares and the `fetch` wrapper import no SDK, so they work with both MCP SDK 1.x (`@modelcontextprotocol/sdk`)
+and 2.x (`@modelcontextprotocol/server`, `@modelcontextprotocol/client`).
 
 ## Usage
 
@@ -78,11 +76,14 @@ const handler = withDelegatedToken(
 export { handler as GET, handler as POST, handler as DELETE };
 ```
 
-The token is the one of the HTTP request that carries each MCP message, also in stateful sessions. Two concurrent
-requests always see their own tokens. The Express and Hono middlewares work for A2A agents too.
+Each MCP message sees the token of the HTTP request that carried it, also in stateful sessions and under concurrency.
+A request with more than one `X-IK-Token` value, as several headers or one joined with commas, gets no token: a proxy
+may have appended the real one to one the caller forged.
+The Express and Hono middlewares work for A2A agents too.
 
-A framework that runs a tool outside the async context of its HTTP request can read the token from the tool's
-second argument (`extra` in SDK 1.x, `ctx` in SDK 2.x):
+If a framework runs tools outside the async context of their HTTP request, read the token from the tool's second
+argument (`extra` in SDK 1.x, `ctx` in SDK 2.x). This is the case for the legacy SSE transport of `mcp-handler` 1.x,
+which relays messages through Redis; alternatively set `disableSse: true`.
 
 ```ts
 import { runWithToken, tokenFromContext } from "@indykite/delegated-token";
@@ -105,10 +106,15 @@ import { delegatedTokenFetch } from "@indykite/delegated-token/fetch";
 const client = new Client({ name: "my-server", version: "1.0.0" });
 await client.connect(new StreamableHTTPClientTransport(new URL(TARGET_MCP_URL), { fetch: delegatedTokenFetch() }));
 const result = await client.callTool({ name: "some_tool", arguments: {} });
+await client.close();
 ```
 
-Each request goes out with the token of the call that made it, so a client opened once, outside any request, is fine
-with both SDK versions.
+> [!IMPORTANT]
+> **Connect MCP clients inside the tool call, and do not share them between requests**, as the
+> [sample](examples/sample-mcp-server/server.ts) does. Each request carries the token of the call that sent it, so a
+> client connected outside a request sends `initialize` without the token, and a gateway answers it with 401, as the
+> MCP authorization spec requires for every request. A client shared between tool calls sends its GET stream and its
+> closing DELETE with the token of the call that opened or closed it, also after that call's request has ended.
 
 **A2A** - build the client from the package's options:
 
@@ -119,43 +125,47 @@ import { delegatedTokenClientOptions } from "@indykite/delegated-token/a2a";
 const client = await new ClientFactory(delegatedTokenClientOptions()).createFromUrl(TARGET_AGENT_URL);
 ```
 
-`delegatedTokenClientOptions(base?, fetch?)` adds `DelegatedTokenInterceptor` to `base` (default:
-`ClientFactoryOptions.default`). For an agent whose card lists the extension
-`https://indykite.com/extensions/delegated-token/v1` in `capabilities.extensions`, the interceptor sets `X-IK-Token`
-and adds the extension to `A2A-Extensions`. Other agents get neither.
+`delegatedTokenClientOptions(base?, { fetch?, legacyCompat?, allowHttp? })` adds `DelegatedTokenInterceptor` to `base`
+(default: `ClientFactoryOptions.default`). For agents whose card lists
+`https://indykite.com/extensions/delegated-token/v1` in `capabilities.extensions`, it sets `X-IK-Token` and adds the
+extension to `A2A-Extensions`.
 
-The A2A HTTP transports send these headers with `fetch`, which keeps them across a redirect to another origin. So the
-options also replace the JSON-RPC and REST transports of `base` with ones whose `fetch` is wrapped in
-`redirectGuard()`, which follows the redirects of a request that carries the token and drops the token on another
-origin. If you configure the transports yourself, pass `fetchImpl: redirectGuard()` to them.
+It also replaces the JSON-RPC and REST transports of `base` with ones whose `fetch` is wrapped in `redirectGuard()`,
+because plain `fetch` keeps custom headers on a cross-origin redirect. The replaced transports' settings are lost, so
+give them here: `fetch` to wrap another `fetch` than the global one, `legacyCompat: { enabled: true }` for v0.3 agents.
+If you configure the transports yourself, pass `fetchImpl: redirectGuard()`.
 
 ### Which targets get the token
 
-A request carries `X-IK-Token` only when there is a token and the target announced the extension:
+A request carries `X-IK-Token` only when there is a token and the target announces the extension. A token the caller
+set itself is never replaced.
 
 - **MCP targets** announce in their OAuth protected resource metadata (RFC 9728): `mcp_extensions` contains
-  `com.indykite/delegated-token`, and `resource` is the target's URL. Before the first request to a target, the
-  client fetches `/.well-known/oauth-protected-resource<path>` on the target's origin, without any of the caller's
-  headers. The fetch stops after 10 seconds, or earlier when the caller's signal aborts. An answer larger than
-  64 KiB, or a compressed one, does not count.
-- The answer is cached per target (scheme, host, port, path and query) for the life of the process; concurrent first
-  calls share one fetch. A 404 is cached as "does not announce". Network errors and other statuses are not cached,
-  and the calls that shared that fetch go out without the token.
-- When a target that is not known to announce answers 401 with `WWW-Authenticate: Bearer resource_metadata="…"`, the
-  client follows the link, only if it is on the target's origin, and retries the request once with the token if the
-  target announces. Only a request whose body can be sent again is retried: no body, a string, a `Uint8Array` or
-  `URLSearchParams`. A `Request` object with a body is not retried, because its body is a stream. A 401 whose body is larger than 64 KiB is returned as it is, without following the link; one
-  whose body takes more than 30 seconds to arrive fails the call with a `TimeoutError`.
+  `com.indykite/delegated-token` and `resource` is the target's URL. Before the first request, the client fetches
+  `/.well-known/oauth-protected-resource<path>` on the target's origin, without the caller's headers (10 s timeout;
+  answers over 64 KiB or compressed are ignored). An aborted call stops waiting, but the shared fetch goes on.
+- **Cache**: per target URL (without fragment), shared by all wrappers; concurrent first calls share one fetch. 2xx and
+  404 answers are cached for an hour, so a target that stops announcing stops getting the token. Other statuses, such
+  as 401 or 5xx, count as "does not announce" for a minute. Network errors are not cached. At most 1024 targets are
+  kept, the least recently used are dropped first. `new ExtensionRegistry({ ttl, errorTtl, maxTargets })` changes
+  these (in milliseconds). Wrappers that reach the same URL through different network paths, such as proxies, need
+  their own `registry: new ExtensionRegistry()`.
+- **401 challenge**: if a target not known to announce answers 401 with
+  `WWW-Authenticate: Bearer resource_metadata="…"` on its own origin, the client reads that metadata and retries once
+  with the token. The link's answer is cached like the well-known one. Only resendable bodies are retried: none, string, `ArrayBuffer`, typed array, `Blob`,
+  `URLSearchParams` or `FormData`, not streams or a `Request` with a body. A 401 body over 64 KiB is returned as is;
+  one slower than 30 s fails with a `TimeoutError`.
+- **Redirects**: the token, also one the caller set, only goes to the request's origin. The wrapper follows redirects
+  itself (at most 20) and drops `X-IK-Token`, `Authorization` and `Cookie` on another origin or on `https` to `http`.
+  With `redirect: "manual"` or `"error"` the caller gets the redirect as `fetch` returns it.
 - **A2A agents** announce in their agent card, see above.
-- A token the caller set itself is never replaced.
-- The token, also one the caller set, only goes to the origin of the request. `fetch` keeps custom headers across a
-  cross-origin redirect, so for a request that carries the token, the wrapper follows the redirects itself (at most 20): a redirect to another
-  origin, or from `https` to `http`, gets neither the token nor `Authorization` and `Cookie`. A caller that sets
-  `redirect: "manual"` or `"error"` gets the redirect as `fetch` returns it.
-- The cache is shared by every wrapper of the process. Wrappers that reach the same URL through different network
-  paths, such as different proxies, must not share it: pass each its own `registry: new ExtensionRegistry()`.
+- **HTTP**: the token only goes over `https`, or over `http` to a loopback host (`localhost`, `127.0.0.0/8`, `::1`).
+  Over plain HTTP anyone on the network could read it, or forge the metadata that announces the extension, so no
+  metadata is fetched either. For A2A, every interface of the card must pass, except gRPC ones. To send it over plain
+  HTTP anyway, for example inside a private network, pass `registry: new ExtensionRegistry({ allowHttp: true })` to
+  `delegatedTokenFetch`, and `allowHttp: true` to `delegatedTokenClientOptions`.
 
-Set `NODE_DEBUG=indykite-delegated-token` to log the metadata fetches that fail and the links that are ignored.
+Set `NODE_DEBUG=indykite-delegated-token` to log the metadata fetches that fail and the links and tokens that are ignored.
 
 > [!WARNING]
 > Announcing the extension does not make a target trustworthy: anyone can announce it, and every target that does
@@ -164,10 +174,9 @@ Set `NODE_DEBUG=indykite-delegated-token` to log the metadata fetches that fail 
 
 ## Example
 
-[`examples/sample-mcp-server`](examples/sample-mcp-server) is a runnable MCP server (SDK 2.x with Express) with two
-tools, `call_mcp_tool` and `ask_agent`, which call an MCP server and an A2A agent through their gateways. It has the
-same interface as the Python sample. Smaller versions for Hono with SDK 1.x and for `mcp-handler` are in
-[`examples/snippets`](examples/snippets).
+[`examples/sample-mcp-server`](examples/sample-mcp-server) is a runnable MCP server (SDK 2.x, Express) whose tools
+`call_mcp_tool` and `ask_agent` call an MCP server and an A2A agent through their gateways, like the Python sample.
+[`examples/snippets`](examples/snippets) has smaller versions for Hono with SDK 1.x and for `mcp-handler`.
 
 ```sh
 docker build -f examples/sample-mcp-server/Dockerfile -t indykite-delegated-token-sample .
@@ -181,7 +190,7 @@ The server listens on `HOST`:`PORT` (default `0.0.0.0:8000`) and answers `GET /h
 
 ## Development
 
-The MCP SDK 1.x and 2.x have different package names, so the tests run against both in one install.
+The tests run against MCP SDK 1.x and 2.x in one install.
 
 ```sh
 corepack enable                    # use the pnpm version from package.json

@@ -102,7 +102,7 @@ export function mcpTarget(announce: boolean): (url: string) => Express {
       );
       const transport = new NodeStreamableHTTPServerTransport({ enableJsonResponse: true });
       res.on("close", () => {
-        void server.close();
+        server.close().catch(() => undefined);
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
@@ -136,13 +136,12 @@ const echo: AgentExecutor = {
   cancelTask: () => Promise.resolve(),
 };
 
-/** An A2A agent that answers each message with the `X-IK-Token` and `A2A-Extensions` it received. */
-function card(url: string, announce: boolean): AgentCard {
+function card(url: string, announce: boolean, version = "1.0"): AgentCard {
   return AgentCard.fromJSON({
     name: "echo",
     description: "Echoes the headers it received",
     version: "1.0.0",
-    supportedInterfaces: [{ url: `${url}/`, protocolBinding: "JSONRPC", protocolVersion: "1.0" }],
+    supportedInterfaces: [{ url: `${url}/`, protocolBinding: "JSONRPC", protocolVersion: version }],
     capabilities: { streaming: false, extensions: announce ? [{ uri: A2A_EXTENSION_URI }] : [] },
     defaultInputModes: ["text/plain"],
     defaultOutputModes: ["text/plain"],
@@ -150,13 +149,29 @@ function card(url: string, announce: boolean): AgentCard {
   });
 }
 
-export function a2aAgent(announce: boolean): (url: string) => Express {
+export interface AgentOptions {
+  /** Speak A2A v0.3 rather than v1.0. */
+  legacy?: boolean;
+  /** Serve the card through `AgentCard.toJSON`, which leaves out empty lists. */
+  protoJson?: boolean;
+}
+
+/** An A2A agent that answers each message with the `X-IK-Token` and `A2A-Extensions` it received. */
+export function a2aAgent(announce: boolean, options: AgentOptions = {}): (url: string) => Express {
   return (url) => {
-    const agentCard = card(url, announce);
+    const agentCard = card(url, announce, options.legacy ? "0.3" : "1.0");
     const handler = new DefaultRequestHandler(agentCard, new InMemoryTaskStore(), echo);
     const app = express();
-    app.use("/.well-known/agent-card.json", agentCardHandler({ agentCardProvider: () => Promise.resolve(agentCard) }));
-    app.use("/", jsonRpcHandler({ requestHandler: handler, userBuilder: UserBuilder.noAuthentication }));
+    app.use(
+      "/.well-known/agent-card.json",
+      options.protoJson
+        ? (_req, res) => {
+            res.json(AgentCard.toJSON(agentCard));
+          }
+        : agentCardHandler({ agentCardProvider: () => Promise.resolve(agentCard) }),
+    );
+    const legacyCompat = { enabled: options.legacy ?? false };
+    app.use("/", jsonRpcHandler({ requestHandler: handler, userBuilder: UserBuilder.noAuthentication, legacyCompat }));
     return app;
   };
 }
@@ -209,7 +224,8 @@ export interface Session {
 
 interface ToolResult {
   content?: unknown;
-  isError?: boolean | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  isError?: boolean | undefined; // skipcq
 }
 
 function decode(result: ToolResult): unknown {

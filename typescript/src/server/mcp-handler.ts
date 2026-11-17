@@ -24,6 +24,9 @@ import { runWithToken, tokenFromHeaders } from "../context.js";
  * Wrap a `(Request) => Response` handler, so each request runs with its `X-IK-Token` header as the delegated token.
  *
  * Extra arguments, such as the route context of Next.js, are passed on to the handler.
+ *
+ * The legacy SSE transport of `mcp-handler` 1.x runs tools outside the request of their message, so they do not see
+ * its token. Disable SSE, or read the token with `tokenFromContext`.
  */
 export function withDelegatedToken<A extends unknown[], R>(
   handler: (req: Request, ...rest: A) => R,

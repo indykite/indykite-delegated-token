@@ -26,6 +26,15 @@ function card(...uris: string[]): AgentCard {
   return { capabilities: { extensions } } as unknown as AgentCard;
 }
 
+// An agent card that announces the extension at the given interfaces, as `url binding`
+function servedAt(...interfaces: string[]): AgentCard {
+  const supportedInterfaces = interfaces.map((served) => {
+    const [url, protocolBinding = "JSONRPC"] = served.split(" ");
+    return { url, protocolBinding, protocolVersion: "1.0" };
+  });
+  return { ...card(A2A_EXTENSION_URI), supportedInterfaces } as AgentCard;
+}
+
 function args(agentCard: AgentCard, options?: RequestOptions): BeforeArgs {
   const before: BeforeArgs = { input: { method: "sendMessage", value: {} } as BeforeArgs["input"], agentCard };
   if (options) {
@@ -34,8 +43,8 @@ function args(agentCard: AgentCard, options?: RequestOptions): BeforeArgs {
   return before;
 }
 
-async function intercept(before: BeforeArgs, token?: string): Promise<BeforeArgs> {
-  await runWithToken(token, () => new DelegatedTokenInterceptor().before(before));
+async function intercept(before: BeforeArgs, token?: string, allowHttp?: boolean): Promise<BeforeArgs> {
+  await runWithToken(token, () => new DelegatedTokenInterceptor({ allowHttp }).before(before));
   return before;
 }
 
@@ -44,8 +53,11 @@ describe("announcesExtension", () => {
     expect(announcesExtension(card(OTHER_URI, A2A_EXTENSION_URI))).toBe(true);
     expect(announcesExtension(card(OTHER_URI))).toBe(false);
     expect(announcesExtension({ capabilities: undefined } as unknown as AgentCard)).toBe(false);
+    // Proto3 JSON leaves out an empty list
+    expect(announcesExtension({ capabilities: {} } as unknown as AgentCard)).toBe(false);
     expect(announcesExtension(null)).toBe(false);
-    expect(announcesExtension(undefined)).toBe(false);
+    // An explicit `undefined`, not a missing argument
+    expect(announcesExtension(undefined)).toBe(false); // skipcq
   });
 });
 
@@ -70,10 +82,24 @@ describe("DelegatedTokenInterceptor", () => {
     expect(parameters.Other).toBe("x");
   });
 
-  it("does not repeat an extension the caller already named", async () => {
-    const options: RequestOptions = { serviceParameters: { "a2a-extensions": A2A_EXTENSION_URI } };
+  it.each([[A2A_EXTENSION_URI], [`${OTHER_URI},${A2A_EXTENSION_URI}`]])(
+    "does not repeat the extensions the caller named in lowercase: %s",
+    async (named) => {
+      const options: RequestOptions = { serviceParameters: { "a2a-extensions": named } };
+      const before = await intercept(args(card(A2A_EXTENSION_URI), options), "tok");
+      const headers = new Headers(before.options?.serviceParameters);
+      expect(headers.get(A2A_EXTENSIONS_HEADER)?.split(",").sort()).toEqual(named.split(",").sort());
+    },
+  );
+
+  it("merges the caller's extensions from every case of the name", async () => {
+    const third = "https://example.com/extensions/third/v1";
+    const options: RequestOptions = {
+      serviceParameters: { [A2A_EXTENSIONS_HEADER]: OTHER_URI, "a2a-extensions": third },
+    };
     const before = await intercept(args(card(A2A_EXTENSION_URI), options), "tok");
-    expect(before.options?.serviceParameters?.[A2A_EXTENSIONS_HEADER]).toBe(A2A_EXTENSION_URI);
+    const headers = new Headers(before.options?.serviceParameters);
+    expect(headers.get(A2A_EXTENSIONS_HEADER)?.split(",").sort()).toEqual([OTHER_URI, third, A2A_EXTENSION_URI].sort());
   });
 
   it.each([[DELEGATED_TOKEN_HEADER], ["x-ik-token"]])("keeps the caller's token in %s", async (name) => {
@@ -100,6 +126,25 @@ describe("DelegatedTokenInterceptor", () => {
     expect(before.options).toBeUndefined();
   });
 
+  it.each([
+    [["https://agent.example.com/"]],
+    [["http://localhost:8080/", "http://127.0.0.1/", "http://[::1]/"]],
+    [["https://agent.example.com/", "agent.example.com:443 GRPC"]],
+  ])("adds the token for an agent served at %j", async (interfaces) => {
+    const before = await intercept(args(servedAt(...interfaces)), "tok");
+    expect(before.options?.serviceParameters?.[DELEGATED_TOKEN_HEADER]).toBe("tok");
+  });
+
+  it.each([[["http://agent.example.com/"]], [["https://agent.example.com/", "http://agent.example.com/ HTTP+JSON"]]])(
+    "adds the token for an agent served at %j only with allowHttp",
+    async (interfaces) => {
+      const blocked = await intercept(args(servedAt(...interfaces)), "tok");
+      expect(blocked.options).toBeUndefined();
+      const allowed = await intercept(args(servedAt(...interfaces)), "tok", true);
+      expect(allowed.options?.serviceParameters?.[DELEGATED_TOKEN_HEADER]).toBe("tok");
+    },
+  );
+
   it("leaves calls without a token unchanged", async () => {
     const before = await intercept(args(card(A2A_EXTENSION_URI)));
     expect(before.options).toBeUndefined();
@@ -116,12 +161,22 @@ describe("delegatedTokenClientOptions", () => {
     const base = ClientFactoryOptions.createFrom(ClientFactoryOptions.default, {
       clientConfig: { interceptors: [other] },
     });
-    const options = delegatedTokenClientOptions(base, vi.fn<typeof fetch>());
+    const options = delegatedTokenClientOptions(base, { fetch: vi.fn<typeof fetch>() });
 
     const interceptors = options.clientConfig?.interceptors ?? [];
     expect(interceptors[0]).toBe(other);
     expect(interceptors[1]).toBeInstanceOf(DelegatedTokenInterceptor);
     expect(options.transports.map((transport) => transport.protocolName).sort()).toEqual(["HTTP+JSON", "JSONRPC"]);
     expect(options.transports).not.toEqual(base.transports);
+  });
+
+  it("gives the transports the legacyCompat setting", () => {
+    const settings = (options: ClientFactoryOptions) =>
+      options.transports.map(
+        (transport) => (transport as unknown as { options: { legacyCompat?: unknown } }).options.legacyCompat,
+      );
+    const legacyCompat = { enabled: true };
+    expect(settings(delegatedTokenClientOptions(undefined, { legacyCompat }))).toEqual([legacyCompat, legacyCompat]);
+    expect(settings(delegatedTokenClientOptions())).toEqual([undefined, undefined]);
   });
 });

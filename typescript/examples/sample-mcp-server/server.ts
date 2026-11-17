@@ -21,6 +21,7 @@
 // Environment:
 //   TARGET_MCP_URL    MCP endpoint that `call_mcp_tool` calls, through its gateway
 //   TARGET_AGENT_URL  base URL of the A2A agent that `ask_agent` calls, through its gateway
+//   ALLOW_HTTP        set to 1 to also send the token over plain HTTP, such as to a gateway in a private network
 //   HOST, PORT        where this server listens (default 0.0.0.0:8000)
 
 import { randomUUID } from "node:crypto";
@@ -29,16 +30,20 @@ import { SendMessageRequest } from "@a2a-js/sdk";
 import { ClientFactory } from "@a2a-js/sdk/client";
 import { delegatedTokenClientOptions } from "@indykite/delegated-token/a2a";
 import { delegatedToken } from "@indykite/delegated-token/express";
-import { delegatedTokenFetch } from "@indykite/delegated-token/fetch";
+import { delegatedTokenFetch, ExtensionRegistry } from "@indykite/delegated-token/fetch";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import { McpServer } from "@modelcontextprotocol/server";
-import * as z from "zod";
+import { z } from "zod";
 
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? "8000");
+const ALLOW_HTTP = process.env.ALLOW_HTTP === "1";
+// One for the process, so the targets' answers are cached
+const REGISTRY = new ExtensionRegistry({ allowHttp: ALLOW_HTTP });
 
+/** The value of the environment variable `name`. Throw if it is not set. */
 function env(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -47,6 +52,7 @@ function env(name: string): string {
   return value;
 }
 
+/** The text blocks of an MCP tool result, joined by newlines. */
 function textOf(content: unknown): string {
   const blocks = Array.isArray(content) ? (content as { type?: string; text?: string }[]) : [];
   return blocks
@@ -55,6 +61,7 @@ function textOf(content: unknown): string {
     .join("\n");
 }
 
+/** An MCP tool result with one text block. */
 function reply(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
@@ -69,7 +76,7 @@ async function callMcpTool(tool: string, args: Record<string, unknown>): Promise
   const client = new Client({ name: "sample-mcp-server", version: "1.0.0" });
   // Adds X-IK-Token if the target announces the extension
   const transport = new StreamableHTTPClientTransport(new URL(env("TARGET_MCP_URL")), {
-    fetch: delegatedTokenFetch(),
+    fetch: delegatedTokenFetch({ registry: REGISTRY }),
   });
   await client.connect(transport);
   try {
@@ -83,7 +90,9 @@ async function callMcpTool(tool: string, args: Record<string, unknown>): Promise
 /** Send a message to the A2A agent at TARGET_AGENT_URL and return its text reply. */
 async function askAgent(text: string): Promise<string> {
   // Adds X-IK-Token if the agent card lists the extension, and never sends it to the origin of a redirect
-  const client = await new ClientFactory(delegatedTokenClientOptions()).createFromUrl(env("TARGET_AGENT_URL"));
+  const client = await new ClientFactory(
+    delegatedTokenClientOptions(undefined, { allowHttp: ALLOW_HTTP }),
+  ).createFromUrl(env("TARGET_AGENT_URL"));
   const request = SendMessageRequest.fromJSON({
     message: { messageId: randomUUID(), role: "ROLE_USER", parts: [{ text }] },
   });
@@ -95,6 +104,7 @@ async function askAgent(text: string): Promise<string> {
     .join("\n");
 }
 
+/** An MCP server with the `call_mcp_tool` and `ask_agent` tools. */
 function buildServer(): McpServer {
   const server = new McpServer({ name: "sample-mcp-server", version: "1.0.0" });
   server.registerTool(
@@ -129,7 +139,7 @@ app.post("/mcp", async (req, res) => {
   const server = buildServer();
   const transport = new NodeStreamableHTTPServerTransport();
   res.on("close", () => {
-    void server.close();
+    server.close().catch(console.error);
   });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);

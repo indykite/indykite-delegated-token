@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   challengeLink,
@@ -22,6 +22,7 @@ import {
   metadataUrl,
   resourceMetadataLink,
   sameOrigin,
+  secureTransport,
   targetKey,
 } from "../src/client/discovery.js";
 import { MCP_EXTENSION_ID } from "../src/index.js";
@@ -51,9 +52,27 @@ function answers(...responses: (MetadataResponse | Error)[]) {
   return fetch;
 }
 
+// A metadata fetch that answers when the test resolves it
+function pending() {
+  let resolve!: (response: MetadataResponse) => void;
+  const answer = new Promise<MetadataResponse>((done) => {
+    resolve = done;
+  });
+  return { fetch: vi.fn<MetadataFetch>(() => answer), resolve };
+}
+
 function urls(fetch: ReturnType<typeof answers>): string[] {
   return fetch.mock.calls.map(([url]) => url);
 }
+
+// The registry reads the clock with `performance.now()`
+function fakeClock(): void {
+  vi.useFakeTimers({ toFake: ["performance"] });
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("targetKey", () => {
   it.each([
@@ -86,6 +105,24 @@ describe("sameOrigin", () => {
     expect(sameOrigin("https://a.com/x", "http://a.com/x")).toBe(false);
     expect(sameOrigin("https://a.com/x", "https://b.com/x")).toBe(false);
     expect(sameOrigin("https://a.com:bad/x", "https://a.com/x")).toBe(false);
+  });
+});
+
+describe("secureTransport", () => {
+  it.each([
+    ["https://mcp.example.com/mcp", true],
+    ["http://localhost:8080/mcp", true],
+    ["http://127.0.0.1/mcp", true],
+    ["http://127.1.2.3/mcp", true],
+    ["http://[::1]:8080/mcp", true],
+    ["http://mcp.example.com/mcp", false],
+    ["http://localhost.example.com/mcp", false],
+    ["http://127.0.0.1.example.com/mcp", false],
+    ["http://[::2]/mcp", false],
+    ["ws://localhost/mcp", false],
+    ["not a url", false],
+  ])("%s -> %s", (url, expected) => {
+    expect(secureTransport(url)).toBe(expected);
   });
 });
 
@@ -150,17 +187,79 @@ describe("ExtensionRegistry.discover", () => {
     expect(registry.known(TARGET)).toBe(false);
   });
 
-  it.each<[string, MetadataResponse | Error]>([
-    ["5xx", { status: 503, body: "" }],
-    ["401", { status: 401, body: "" }],
-    ["network", new Error("refused")],
-  ])("does not cache a failure: %s", async (_name, failure) => {
+  it("does not cache a network error", async () => {
     const registry = new ExtensionRegistry();
-    const fetch = answers(failure, prm());
+    const fetch = answers(new Error("refused"), prm());
     expect(await registry.discover(TARGET, fetch)).toBe(false);
     expect(registry.known(TARGET)).toBeUndefined();
     expect(await registry.discover(TARGET, fetch)).toBe(true);
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each<[string, MetadataResponse]>([
+    ["5xx", { status: 503, body: "" }],
+    ["401", { status: 401, body: "" }],
+    ["3xx", { status: 302, body: "" }],
+  ])("caches another status as not announced for errorTtl: %s", async (_name, failure) => {
+    fakeClock();
+    const registry = new ExtensionRegistry({ errorTtl: 1000 });
+    const fetch = answers(failure, prm());
+    expect(await registry.discover(TARGET, fetch)).toBe(false);
+    vi.advanceTimersByTime(999);
+    expect(await registry.discover(TARGET, fetch)).toBe(false);
+    expect(fetch).toHaveBeenCalledOnce();
+
+    vi.advanceTimersByTime(1);
+    expect(registry.known(TARGET)).toBeUndefined();
+    expect(await registry.discover(TARGET, fetch)).toBe(true);
+  });
+
+  it("asks again after ttl, so a target that stops announcing stops getting the token", async () => {
+    fakeClock();
+    const registry = new ExtensionRegistry({ ttl: 1000 });
+    const fetch = answers(prm(), { status: 404, body: "" });
+    expect(await registry.discover(TARGET, fetch)).toBe(true);
+    vi.advanceTimersByTime(999);
+    expect(registry.known(TARGET)).toBe(true);
+
+    vi.advanceTimersByTime(1);
+    expect(await registry.discover(TARGET, fetch)).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps answers an hour, and other statuses a minute, by default", async () => {
+    fakeClock();
+    const registry = new ExtensionRegistry();
+    const other = "https://mcp.example.com/other";
+    await registry.discover(TARGET, answers(prm()));
+    await registry.discover(other, answers({ status: 500, body: "" }));
+    vi.advanceTimersByTime(59_999);
+    expect(registry.known(other)).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(registry.known(other)).toBeUndefined();
+
+    vi.advanceTimersByTime(3_600_000 - 60_001);
+    expect(registry.known(TARGET)).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(registry.known(TARGET)).toBeUndefined();
+  });
+
+  it("keeps the maxTargets most recently used targets", async () => {
+    const registry = new ExtensionRegistry({ maxTargets: 2 });
+    const first = "https://mcp.example.com/first";
+    const second = "https://mcp.example.com/second";
+    const third = "https://mcp.example.com/third";
+    for (const target of [first, second]) {
+      await registry.discover(target, answers(prm(target)));
+    }
+    expect(registry.known(first)).toBe(true);
+    await registry.discover(third, answers(prm(third)));
+    expect([registry.known(first), registry.known(second), registry.known(third)]).toEqual([true, undefined, true]);
+  });
+
+  it("has allowHttp off by default", () => {
+    expect(new ExtensionRegistry().allowHttp).toBe(false);
+    expect(new ExtensionRegistry({ allowHttp: true }).allowHttp).toBe(true);
   });
 
   it("shares one fetch among concurrent first calls", async () => {
@@ -193,6 +292,25 @@ describe("ExtensionRegistry.discover", () => {
     registry.clear();
     expect(registry.known(TARGET)).toBeUndefined();
   });
+
+  it("does not let a fetch that started before clear fill the cache", async () => {
+    const registry = new ExtensionRegistry();
+    const old = pending();
+    const before = registry.discover(TARGET, old.fetch);
+    registry.clear();
+    const fresh = pending();
+    const after = registry.discover(TARGET, fresh.fetch);
+    expect(fresh.fetch).toHaveBeenCalledOnce();
+
+    old.resolve(prm());
+    expect(await before).toBe(true);
+    expect(registry.known(TARGET)).toBeUndefined();
+    const shared = registry.discover(TARGET, fresh.fetch);
+    fresh.resolve({ status: 404, body: "" });
+    expect(await Promise.all([after, shared])).toEqual([false, false]);
+    expect(fresh.fetch).toHaveBeenCalledOnce();
+    expect(registry.known(TARGET)).toBe(false);
+  });
 });
 
 describe("ExtensionRegistry.learnFromChallenge", () => {
@@ -211,6 +329,22 @@ describe("ExtensionRegistry.learnFromChallenge", () => {
     await registry.discover(TARGET, fetch);
     expect(await registry.learnFromChallenge(TARGET, CHALLENGE, fetch)).toBe(true);
     expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("caches a link that does not announce", async () => {
+    fakeClock();
+    const registry = new ExtensionRegistry({ errorTtl: 1000 });
+    const other = "https://mcp.example.com/other-prm";
+    const fetch = answers(prm(TARGET, false), { status: 500, body: "" }, prm());
+    expect(await registry.learnFromChallenge(TARGET, CHALLENGE, fetch)).toBe(false);
+    expect(await registry.learnFromChallenge(TARGET, CHALLENGE, fetch)).toBe(false);
+    expect(await registry.learnFromChallenge(TARGET, `Bearer resource_metadata="${other}"`, fetch)).toBe(false);
+    expect(await registry.learnFromChallenge(TARGET, `Bearer resource_metadata="${other}"`, fetch)).toBe(false);
+    expect(urls(fetch)).toEqual([LINK, other]);
+
+    vi.advanceTimersByTime(1000);
+    expect(await registry.learnFromChallenge(TARGET, `Bearer resource_metadata="${other}"`, fetch)).toBe(true);
+    expect(registry.known(TARGET)).toBe(true);
   });
 
   it("shares one fetch among concurrent challenges", async () => {

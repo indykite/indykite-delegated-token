@@ -33,6 +33,7 @@ import { createMcpHandler as createMcpHandlerV2 } from "mcp-handler";
 import { createMcpHandler as createMcpHandlerV1 } from "mcp-handler-v1";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { delegatedTokenClientOptions } from "../src/client/a2a.js";
 import { delegatedTokenFetch, ExtensionRegistry } from "../src/client/fetch.js";
 import { A2A_EXTENSION_URI, getDelegatedToken, runWithToken } from "../src/index.js";
 import { delegatedToken as expressDelegatedToken } from "../src/server/express.js";
@@ -75,12 +76,14 @@ type Sample = (relay: Relay, stateful: boolean) => Built;
 type RequestListenerOrHandler = ((req: IncomingMessage, res: ServerResponse) => void) | FetchHandler;
 
 interface NodeTransport {
-  sessionId?: string | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  sessionId?: string | undefined; // skipcq
   handleRequest: (req: IncomingMessage, res: ServerResponse, body?: unknown) => Promise<void>;
 }
 
 interface WebTransport {
-  sessionId?: string | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  sessionId?: string | undefined; // skipcq
   handleRequest: (req: Request) => Promise<Response>;
 }
 
@@ -170,6 +173,7 @@ function sessionId(stateful: boolean) {
 function sessions<T extends { sessionId?: string | undefined }>(make: () => Promise<T>) {
   const known = new Map<string, T>();
   return {
+    // skipcq: JS-0116 - async, so it returns a promise for a known session too
     find: async (id: string | null | undefined) => (id ? known.get(id) : undefined) ?? make(),
     remember: (transport: T) => {
       if (transport.sessionId) {
@@ -332,6 +336,28 @@ describe("targets", () => {
 
   it("an agent that does not announce gets nothing", async () => {
     expect(await runWithToken("tok", () => askAgent(targets.agentSilent))).toEqual({ token: null, extensions: null });
+  });
+
+  it("an agent whose card leaves out its empty extensions gets nothing", async () => {
+    const agent = await serve(a2aAgent(false, { protoJson: true }));
+    try {
+      expect(await runWithToken("tok", () => askAgent(agent.url))).toEqual({ token: null, extensions: null });
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it("a v0.3 agent that announces gets the token through transports with legacyCompat", async () => {
+    const agent = await serve(a2aAgent(true, { legacy: true }));
+    try {
+      const options = delegatedTokenClientOptions(undefined, { legacyCompat: { enabled: true } });
+      expect(await runWithToken("tok", () => askAgent(agent.url, options))).toEqual({
+        token: "tok",
+        extensions: A2A_EXTENSION_URI,
+      });
+    } finally {
+      await agent.close();
+    }
   });
 
   it.each(VERSIONS)("a long-lived %s client sends the token of each call", async (version) => {
