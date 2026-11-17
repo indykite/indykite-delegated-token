@@ -83,3 +83,13 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: typescript
           files: typescript/coverage/lcov.info
+
+  sample-image:
+    name: Sample image
+    runs-on: ubuntu-latest
+    steps:
+      - name: actions/checkout
+        uses: indykite/.github/.github/actions/git-checkout@master # actions/checkout with dynamic fetch-depth resolution
+
+      - name: docker build
+        run: docker build -f examples/sample-mcp-server/Dockerfile -t indykite-delegated-token-sample .

@@ -1,0 +1,24 @@
+{
+  "name": "indykite-delegated-token-sample-mcp-server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Sample MCP server that propagates the IndyKite delegated token",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "1.3.0",
+    "@indykite/delegated-token": "file:./indykite-delegated-token.tgz",
+    "@modelcontextprotocol/client": "2.4.0",
+    "@modelcontextprotocol/express": "2.0.2",
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
+    "express": "5.3.0",
+    "zod": "4.6.7"
+  }
+}
