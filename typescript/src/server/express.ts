@@ -12,12 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { describe, expect, it } from "vitest";
+/**
+ * Express middleware that makes the delegated token of each request available to its handlers.
+ *
+ * @packageDocumentation
+ */
 
-import { DELEGATED_TOKEN_HEADER } from "../src/index.js";
+import type { RequestHandler } from "express";
 
-describe("package", () => {
-  it("exports the header name", () => {
-    expect(DELEGATED_TOKEN_HEADER).toBe("X-IK-Token");
-  });
-});
+import { runWithToken, tokenFromHeaders } from "../context.js";
+
+/** Run the rest of each request with its `X-IK-Token` header as the delegated token. */
+export function delegatedToken(): RequestHandler {
+  return (req, _res, next) => {
+    runWithToken(tokenFromHeaders(req.headers), next);
+  };
+}

@@ -10,5 +10,6 @@ licenses:
       - "typescript/*.ts"
       - "typescript/src/**"
       - "typescript/test/**"
+      - "typescript/examples/**"
       - "typescript/dist/**"
     statement: IndyKite copyright header of first-party source code
