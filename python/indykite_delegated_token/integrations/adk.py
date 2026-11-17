@@ -34,6 +34,4 @@ def header_provider(context: ReadonlyContext) -> dict[str, str]:  # skipcq: PYL-
     that do not announce the extension.
     """
     token = get_delegated_token()
-    if token is None:
-        return {}
-    return {DELEGATED_TOKEN_HEADER: token}
+    return {} if token is None else {DELEGATED_TOKEN_HEADER: token}
