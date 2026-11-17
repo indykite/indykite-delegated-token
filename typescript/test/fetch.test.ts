@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { createHash } from "node:crypto";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -32,6 +34,8 @@ const TARGET = "https://mcp.example.com/mcp";
 const METADATA = "https://mcp.example.com/.well-known/oauth-protected-resource/mcp";
 const LINK = "https://mcp.example.com/prm";
 const CHALLENGE = `Bearer resource_metadata="${LINK}"`;
+const SHA256_FINAL = createHash("sha256").update("final").digest("base64");
+const SHA512_FINAL_URL = createHash("sha512").update("final").digest("base64url");
 
 type Handler = (url: string, init: RequestInit) => Response | Promise<Response>;
 
@@ -108,6 +112,27 @@ function slowStream(first?: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
+/** A form with one field. */
+function form(name: string, value: string): FormData {
+  const data = new FormData();
+  data.set(name, value);
+  return data;
+}
+
+/** The content of a body, comparable across copies: the entries of a form, the text of anything else. */
+function payload(body: RequestInit["body"]): Promise<unknown> {
+  return body instanceof FormData ? Promise.resolve([...body]) : new Response(body).text();
+}
+
+/** A promise and the function that resolves it. */
+function deferred() {
+  let resolve: (response: Response) => void = () => undefined;
+  const promise = new Promise<Response>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -124,7 +149,8 @@ describe("delegatedTokenFetch", () => {
   it("sends the token to a target that announces, and caches the answer", async () => {
     const { send, registry, fetch } = setup({ [METADATA]: () => announced(), [TARGET]: ok });
     await withToken(() => fetch(TARGET, { method: "POST", body: "{}" }));
-    await withToken(() => fetch(TARGET, { method: "POST", body: "{}" }));
+    const response = await withToken(() => fetch(TARGET, { method: "POST", body: "{}" }));
+    expect(response.redirected).toBe(false);
     expect(urls(send)).toEqual([METADATA, TARGET, TARGET]);
     expect(tokens(send)).toEqual(["tok", "tok"]);
     expect(registry.known(TARGET)).toBe(true);
@@ -168,13 +194,15 @@ describe("delegatedTokenFetch", () => {
 });
 
 describe("Request input", () => {
-  it("sends the request itself, with the token", async () => {
+  it("sends a copy of the request, with the token", async () => {
     const { send, fetch } = setup({ [METADATA]: () => announced(), [TARGET]: ok });
     const request = new Request(TARGET, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "hi" });
     await withToken(() => fetch(request));
     const [input, init] = send.mock.calls[1] ?? [];
     const headers = new Headers(init?.headers);
-    expect(input).toBe(request);
+    expect(input).toBeInstanceOf(Request);
+    expect((input as Request).method).toBe("POST");
+    expect(await (input as Request).text()).toBe("hi");
     expect(headers.get("x-ik-token")).toBe("tok");
     expect(headers.get("content-type")).toBe("text/plain");
     expect(init?.redirect).toBe("manual");
@@ -190,13 +218,9 @@ describe("Request input", () => {
 
   it("keeps the request's options", async () => {
     const { send, fetch } = setup({ [METADATA]: () => announced(), [TARGET]: ok });
-    const request = new Request(TARGET, {
-      integrity: "sha256-abc",
-      cache: "no-store",
-      credentials: "omit",
-    } as RequestInit);
+    const request = new Request(TARGET, { cache: "no-store", credentials: "omit" } as RequestInit);
     await withToken(() => fetch(request));
-    expect(send.mock.calls[1]?.[0]).toMatchObject({ integrity: "sha256-abc", cache: "no-store", credentials: "omit" });
+    expect(send.mock.calls[1]?.[0]).toMatchObject({ cache: "no-store", credentials: "omit" });
   });
 
   it("sends a keepalive request with a body through the native fetch", async () => {
@@ -214,14 +238,45 @@ describe("Request input", () => {
     }
   });
 
+  it.each([
+    ["the hash of the final body", `sha256-${SHA256_FINAL}`, "final"],
+    ["the hash in base64url, among weaker ones", `sha256-x sha512-${SHA512_FINAL_URL}?opt`, "final"],
+    ["an unknown algorithm only", "md5-abc", "final"],
+    ["a wrong hash", "sha256-abc", "integrity mismatch"],
+  ])("checks the integrity of the final response, through the native fetch: %s", async (_name, integrity, outcome) => {
+    const target = await serve(() => (req, res) => {
+      if (req.url === "/start") {
+        res.writeHead(302, { Location: "/end" }).end();
+        return;
+      }
+      res.end("final");
+    });
+    try {
+      const guarded = redirectGuard();
+      const init = { headers: { "X-IK-Token": "caller" }, integrity };
+      for (const call of [
+        () => guarded(`${target.url}/start`, init),
+        () => guarded(new Request(`${target.url}/start`, init)),
+      ]) {
+        if (outcome === "integrity mismatch") {
+          await expect(call()).rejects.toThrow(outcome);
+          continue;
+        }
+        expect(await (await call()).text()).toBe(outcome);
+      }
+    } finally {
+      await target.close();
+    }
+  });
+
   it("keeps the request's options on a redirect", async () => {
     const next = "https://mcp.example.com/next";
     const { send, fetch } = setup({ [METADATA]: () => announced(), [TARGET]: () => redirect(302, next), [next]: ok });
-    const init = { cache: "no-store", integrity: "sha256-abc", headers: { Accept: "text/plain" } } as RequestInit;
+    const init = { cache: "no-store", headers: { Accept: "text/plain" } } as RequestInit;
     const request = new Request(TARGET, init);
     await withToken(() => fetch(request));
     const [, hop] = send.mock.calls[2] ?? [];
-    expect(hop).toMatchObject({ method: "GET", cache: "no-store", integrity: "sha256-abc", body: null });
+    expect(hop).toMatchObject({ method: "GET", cache: "no-store", body: null });
     expect(Object.fromEntries(new Headers(hop?.headers))).toEqual({ accept: "text/plain", "x-ik-token": "tok" });
   });
 
@@ -253,6 +308,52 @@ describe("Request input", () => {
     const { send, fetch } = setup({ [METADATA]: notFound, [LINK]: () => announced(), [TARGET]: target });
     await withToken(() => fetch(new Request(TARGET)));
     expect(tokens(send)).toEqual([null, "tok"]);
+  });
+
+  it.each([["a URL"], ["a Request"]])("sends the headers of %s as they were at the call", async (form) => {
+    const metadata = deferred();
+    const { send, fetch } = setup({ [METADATA]: () => metadata.promise, [TARGET]: ok });
+    const headers = new Headers({ Authorization: "A" });
+    const request = new Request(TARGET, { headers });
+    const call = withToken(() => (form === "a URL" ? fetch(TARGET, { headers }) : fetch(request)));
+    headers.set("Authorization", "B");
+    request.headers.set("Authorization", "B");
+    metadata.resolve(announced());
+    await call;
+    const [input, init] = send.mock.calls[1] ?? [];
+    expect(headersOf(input, init).get("authorization")).toBe("A");
+  });
+
+  it.each([
+    ["Uint8Array", (text: string) => new TextEncoder().encode(text), (body: Uint8Array) => body.fill(0)],
+    [
+      "ArrayBuffer",
+      (text: string) => new TextEncoder().encode(text).buffer,
+      (body: ArrayBuffer) => new Uint8Array(body).fill(0),
+    ],
+    [
+      "URLSearchParams",
+      (text: string) => new URLSearchParams({ a: text }),
+      (body: URLSearchParams) => {
+        body.set("a", "B");
+      },
+    ],
+    [
+      "FormData",
+      (text: string) => form("a", text),
+      (body: FormData) => {
+        body.set("a", "B");
+      },
+    ],
+  ] as const)("sends a %s body as it was at the call", async (_name, make, change) => {
+    const metadata = deferred();
+    const { send, fetch } = setup({ [METADATA]: () => metadata.promise, [TARGET]: ok });
+    const body = make("A");
+    const call = withToken(() => fetch(TARGET, { method: "POST", body }));
+    (change as (body: RequestInit["body"]) => void)(body);
+    metadata.resolve(announced());
+    await call;
+    expect(await payload(send.mock.calls[1]?.[1]?.body)).toEqual(await payload(make("A")));
   });
 
   it("keeps a token set in the request's headers", async () => {
@@ -303,13 +404,14 @@ describe("401 challenge", () => {
   });
 
   it("returns the 401 when the link does not announce", async () => {
+    const answer = unauthorized("denied");
     const { send, fetch } = setup({
       [METADATA]: notFound,
       [LINK]: () => Response.json({ resource: TARGET }),
-      [TARGET]: () => unauthorized("denied"),
+      [TARGET]: () => answer,
     });
     const response = await withToken(() => fetch(TARGET));
-    expect(response.status).toBe(401);
+    expect(response).toBe(answer);
     expect(response.headers.get("www-authenticate")).toBe(CHALLENGE);
     expect(await response.text()).toBe("denied");
     expect(urls(send)).toEqual([METADATA, TARGET, LINK]);
@@ -370,9 +472,26 @@ describe("401 challenge", () => {
     const answer = new Response(body, { status: 401, headers: { "WWW-Authenticate": CHALLENGE } });
     const { send, fetch } = setup({ [METADATA]: notFound, [TARGET]: () => answer });
     const response = await withToken(() => fetch(TARGET));
-    expect(response.status).toBe(401);
+    expect(response).toBe(answer);
     expect(await response.text()).toBe(`${head}tail`);
     expect(urls(send)).toEqual([METADATA, TARGET]);
+  });
+
+  it("keeps the URL and type of a fetched 401", async () => {
+    const served = await serve((url) => (req, res) => {
+      const challenge = `Bearer resource_metadata="${url}/prm"`;
+      res.writeHead(req.url === "/mcp" ? 401 : 404, { "WWW-Authenticate": challenge }).end("denied");
+    });
+    try {
+      const fetch = delegatedTokenFetch({ registry: new ExtensionRegistry() });
+      const response = await withToken(() => fetch(`${served.url}/mcp`));
+      expect(response.status).toBe(401);
+      expect(response.url).toBe(`${served.url}/mcp`);
+      expect(response.clone().type).toBe("basic");
+      expect(await response.text()).toBe("denied");
+    } finally {
+      await served.close();
+    }
   });
 
   it("passes on the cancel of a 401 larger than the limit", async () => {
@@ -403,6 +522,19 @@ describe("401 challenge", () => {
     await vi.advanceTimersByTimeAsync(READ_DEADLINE);
     await outcome;
   });
+
+  it("times out a 401 whose tee'd body does not arrive", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // Cancelling one branch of a tee waits for the other
+    const [body, other] = slowStream().tee();
+    const answer = new Response(body, { status: 401, headers: { "WWW-Authenticate": CHALLENGE } });
+    const { fetch } = setup({ [METADATA]: notFound, [TARGET]: () => answer });
+    const pending = withToken(() => fetch(TARGET));
+    const outcome = expect(pending).rejects.toThrow(`response body not read within ${String(READ_DEADLINE)} ms`);
+    await vi.advanceTimersByTimeAsync(READ_DEADLINE);
+    await outcome;
+    await other.cancel();
+  });
 });
 
 describe("redirects", () => {
@@ -418,7 +550,9 @@ describe("redirects", () => {
     const init = { method: "POST", headers: { Authorization: "Bearer a", Cookie: "c=1" }, body: "{}" };
     const response = await withToken(() => fetch(TARGET, init));
 
+    expect(response.clone().clone().redirected).toBe(true);
     expect(await response.text()).toBe("ok");
+    expect(response.redirected).toBe(true);
     const [, hop] = send.mock.calls[2] ?? [];
     const headers = new Headers(hop?.headers);
     expect(urlOf(send.mock.calls[2]?.[0])).toBe(location);
@@ -495,6 +629,22 @@ describe("redirects", () => {
     expect(send.mock.calls[2]?.[1]?.method).toBeUndefined();
   });
 
+  it.each([
+    ["follows", 2],
+    ["stops after the limit", MAX_REDIRECTS + 1],
+  ])("%s without waiting for the cancel of tee'd redirect bodies", async (_name, hops) => {
+    let sent = 0;
+    // Cancelling one branch of a tee waits for the other, which nobody reads
+    const teed = () => new Response(slowStream().tee()[0], { status: 302, headers: { Location: TARGET } });
+    const { fetch } = setup({ [METADATA]: () => announced(), [TARGET]: () => (++sent > hops ? ok() : teed()) });
+    const response = withToken(() => fetch(TARGET));
+    if (hops > MAX_REDIRECTS) {
+      await expect(response).rejects.toThrow("redirect count exceeded");
+      return;
+    }
+    expect(await (await response).text()).toBe("ok");
+  });
+
   it("stop after the limit", async () => {
     const { send, fetch } = setup({ [METADATA]: () => announced(), [TARGET]: () => redirect(302, TARGET) });
     await expect(withToken(() => fetch(TARGET))).rejects.toThrow("redirect count exceeded");
@@ -505,6 +655,19 @@ describe("redirects", () => {
     const answer = new Response(null, { status: 302 });
     const { fetch } = setup({ [METADATA]: () => announced(), [TARGET]: () => answer });
     expect(await withToken(() => fetch(TARGET))).toBe(answer);
+  });
+
+  it.each([
+    ["Blob", () => new Blob(["{}"])],
+    ["ArrayBuffer", () => new TextEncoder().encode("{}").buffer],
+    ["FormData", () => form("a", "1")],
+  ])("follow a redirect that resends a %s body", async (_name, body) => {
+    const next = "https://mcp.example.com/next";
+    const sent = body();
+    const { send, fetch } = setup({ [METADATA]: () => announced(), [TARGET]: () => redirect(307, next), [next]: ok });
+    const response = await withToken(() => fetch(TARGET, { method: "POST", body: sent }));
+    expect(await response.text()).toBe("ok");
+    expect(await payload(send.mock.calls[2]?.[1]?.body)).toEqual(await payload(sent));
   });
 
   it("return a redirect that would resend a streamed body", async () => {
@@ -536,14 +699,66 @@ describe("metadata fetch", () => {
     expect(init?.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it("is aborted with the caller's signal", async () => {
+  it("is not aborted with the caller's signal", async () => {
     const { send, fetch } = setup({ [METADATA]: notFound, [TARGET]: ok });
     const controller = new AbortController();
     await withToken(() => fetch(TARGET, { signal: controller.signal }));
-    const signal = send.mock.calls[0]?.[1]?.signal;
-    expect(signal?.aborted).toBe(false);
     controller.abort();
-    expect(signal?.aborted).toBe(true);
+    expect(send.mock.calls[0]?.[1]?.signal?.aborted).toBe(false);
+  });
+
+  it.each([
+    ["first", 0],
+    ["later", 1],
+  ])("lets the %s caller stop waiting, and gives the others the shared answer", async (_name, aborting) => {
+    const metadata = deferred();
+    const { send, fetch } = setup({ [METADATA]: () => metadata.promise, [TARGET]: ok });
+    const controllers = [new AbortController(), new AbortController()];
+    const calls = controllers.map((controller) => withToken(() => fetch(TARGET, { signal: controller.signal })));
+    await vi.waitFor(() => {
+      expect(urls(send)).toEqual([METADATA]);
+    });
+
+    controllers[aborting]?.abort(new Error("stop"));
+    await expect(calls[aborting]).rejects.toThrow("stop");
+    metadata.resolve(announced());
+    await expect(calls[1 - aborting]).resolves.toBeInstanceOf(Response);
+    expect(tokens(send)).toEqual(["tok"]);
+  });
+
+  it("rejects a call whose signal aborted before discovery", async () => {
+    const { send, fetch } = setup({ [METADATA]: notFound, [TARGET]: ok });
+    const call = withToken(() => fetch(TARGET, { signal: AbortSignal.abort(new Error("stop")) }));
+    await expect(call).rejects.toThrow("stop");
+    expect(urls(send)).toEqual([METADATA]);
+  });
+
+  it("does not leave a failed discovery unhandled when the signal aborted before", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const { fetch } = setup({});
+      const call = withToken(() => fetch("not a url", { signal: AbortSignal.abort(new Error("stop")) }));
+      await expect(call).rejects.toThrow("stop");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+    expect(unhandled).not.toHaveBeenCalled();
+  });
+
+  it("lets a caller stop waiting for the link of a 401", async () => {
+    const link = deferred();
+    const { send, fetch } = setup({ [METADATA]: notFound, [LINK]: () => link.promise, [TARGET]: () => unauthorized() });
+    const controller = new AbortController();
+    const call = withToken(() => fetch(TARGET, { signal: controller.signal }));
+    await vi.waitFor(() => {
+      expect(urls(send)).toEqual([METADATA, TARGET, LINK]);
+    });
+
+    controller.abort(new Error("stop"));
+    await expect(call).rejects.toThrow("stop");
+    link.resolve(notFound());
   });
 
   it.each([

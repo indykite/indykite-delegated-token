@@ -51,6 +51,15 @@ function answers(...responses: (MetadataResponse | Error)[]) {
   return fetch;
 }
 
+// A metadata fetch that answers when the test resolves it
+function pending() {
+  let resolve!: (response: MetadataResponse) => void;
+  const answer = new Promise<MetadataResponse>((done) => {
+    resolve = done;
+  });
+  return { fetch: vi.fn<MetadataFetch>(() => answer), resolve };
+}
+
 function urls(fetch: ReturnType<typeof answers>): string[] {
   return fetch.mock.calls.map(([url]) => url);
 }
@@ -192,6 +201,25 @@ describe("ExtensionRegistry.discover", () => {
     await registry.discover(TARGET, answers(prm()));
     registry.clear();
     expect(registry.known(TARGET)).toBeUndefined();
+  });
+
+  it("does not let a fetch that started before clear fill the cache", async () => {
+    const registry = new ExtensionRegistry();
+    const old = pending();
+    const before = registry.discover(TARGET, old.fetch);
+    registry.clear();
+    const fresh = pending();
+    const after = registry.discover(TARGET, fresh.fetch);
+    expect(fresh.fetch).toHaveBeenCalledOnce();
+
+    old.resolve(prm());
+    expect(await before).toBe(true);
+    expect(registry.known(TARGET)).toBeUndefined();
+    const shared = registry.discover(TARGET, fresh.fetch);
+    fresh.resolve({ status: 404, body: "" });
+    expect(await Promise.all([after, shared])).toEqual([false, false]);
+    expect(fresh.fetch).toHaveBeenCalledOnce();
+    expect(registry.known(TARGET)).toBe(false);
   });
 });
 

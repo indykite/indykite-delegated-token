@@ -19,7 +19,7 @@ import { delegatedTokenFetch } from "@indykite/delegated-token/fetch";
 import { withDelegatedToken } from "@indykite/delegated-token/mcp-handler";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { createMcpHandler } from "mcp-handler";
-import * as z from "zod";
+import { z } from "zod";
 
 const handler = createMcpHandler((server) => {
   server.registerTool(

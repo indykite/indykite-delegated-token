@@ -34,11 +34,12 @@ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/cli
 import { createMcpExpressApp } from "@modelcontextprotocol/express";
 import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import { McpServer } from "@modelcontextprotocol/server";
-import * as z from "zod";
+import { z } from "zod";
 
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? "8000");
 
+/** The value of the environment variable `name`. Throw if it is not set. */
 function env(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -47,6 +48,7 @@ function env(name: string): string {
   return value;
 }
 
+/** The text blocks of an MCP tool result, joined by newlines. */
 function textOf(content: unknown): string {
   const blocks = Array.isArray(content) ? (content as { type?: string; text?: string }[]) : [];
   return blocks
@@ -55,6 +57,7 @@ function textOf(content: unknown): string {
     .join("\n");
 }
 
+/** An MCP tool result with one text block. */
 function reply(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
@@ -95,6 +98,7 @@ async function askAgent(text: string): Promise<string> {
     .join("\n");
 }
 
+/** An MCP server with the `call_mcp_tool` and `ask_agent` tools. */
 function buildServer(): McpServer {
   const server = new McpServer({ name: "sample-mcp-server", version: "1.0.0" });
   server.registerTool(
@@ -129,7 +133,7 @@ app.post("/mcp", async (req, res) => {
   const server = buildServer();
   const transport = new NodeStreamableHTTPServerTransport();
   res.on("close", () => {
-    void server.close();
+    server.close().catch(console.error);
   });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);

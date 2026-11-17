@@ -45,7 +45,8 @@ describe("announcesExtension", () => {
     expect(announcesExtension(card(OTHER_URI))).toBe(false);
     expect(announcesExtension({ capabilities: undefined } as unknown as AgentCard)).toBe(false);
     expect(announcesExtension(null)).toBe(false);
-    expect(announcesExtension(undefined)).toBe(false);
+    // An explicit `undefined`, not a missing argument
+    expect(announcesExtension(undefined)).toBe(false); // skipcq
   });
 });
 
@@ -70,10 +71,24 @@ describe("DelegatedTokenInterceptor", () => {
     expect(parameters.Other).toBe("x");
   });
 
-  it("does not repeat an extension the caller already named", async () => {
-    const options: RequestOptions = { serviceParameters: { "a2a-extensions": A2A_EXTENSION_URI } };
+  it.each([[A2A_EXTENSION_URI], [`${OTHER_URI},${A2A_EXTENSION_URI}`]])(
+    "does not repeat the extensions the caller named in lowercase: %s",
+    async (named) => {
+      const options: RequestOptions = { serviceParameters: { "a2a-extensions": named } };
+      const before = await intercept(args(card(A2A_EXTENSION_URI), options), "tok");
+      const headers = new Headers(before.options?.serviceParameters);
+      expect(headers.get(A2A_EXTENSIONS_HEADER)?.split(",").sort()).toEqual(named.split(",").sort());
+    },
+  );
+
+  it("merges the caller's extensions from every case of the name", async () => {
+    const third = "https://example.com/extensions/third/v1";
+    const options: RequestOptions = {
+      serviceParameters: { [A2A_EXTENSIONS_HEADER]: OTHER_URI, "a2a-extensions": third },
+    };
     const before = await intercept(args(card(A2A_EXTENSION_URI), options), "tok");
-    expect(before.options?.serviceParameters?.[A2A_EXTENSIONS_HEADER]).toBe(A2A_EXTENSION_URI);
+    const headers = new Headers(before.options?.serviceParameters);
+    expect(headers.get(A2A_EXTENSIONS_HEADER)?.split(",").sort()).toEqual([OTHER_URI, third, A2A_EXTENSION_URI].sort());
   });
 
   it.each([[DELEGATED_TOKEN_HEADER], ["x-ik-token"]])("keeps the caller's token in %s", async (name) => {

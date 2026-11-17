@@ -102,7 +102,7 @@ export function mcpTarget(announce: boolean): (url: string) => Express {
       );
       const transport = new NodeStreamableHTTPServerTransport({ enableJsonResponse: true });
       res.on("close", () => {
-        void server.close();
+        server.close().catch(() => undefined);
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
@@ -209,7 +209,8 @@ export interface Session {
 
 interface ToolResult {
   content?: unknown;
-  isError?: boolean | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  isError?: boolean | undefined; // skipcq
 }
 
 function decode(result: ToolResult): unknown {

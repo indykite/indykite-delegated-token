@@ -17,9 +17,11 @@ import { type HeadersLike, tokenFromHeaders } from "../context.js";
 /** The parts of an MCP tool's second argument that carry its HTTP request, in SDK v1 and v2. */
 export interface ToolContext {
   /** SDK v1: `extra.requestInfo`. */
-  requestInfo?: { headers?: HeadersLike } | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  requestInfo?: { headers?: HeadersLike } | undefined; // skipcq
   /** SDK v2: `ctx.http`. */
-  http?: { req?: { headers: Headers } | undefined } | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  http?: { req?: { headers: Headers } | undefined } | undefined; // skipcq
 }
 
 /**

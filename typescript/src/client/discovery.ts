@@ -38,6 +38,7 @@ export type MetadataFetch = (url: string) => Promise<MetadataResponse>;
 
 const RESOURCE_METADATA = /resource_metadata\s*=\s*(?:"([^"]*)"|([^\s,]+))/i;
 
+/** Scheme, host and port of `url`. */
 function origin(url: string): string {
   const parsed = new URL(url);
   return `${parsed.protocol}//${parsed.host}`;
@@ -101,10 +102,12 @@ export function challengeLink(target: string, wwwAuthenticate: string): string |
   return link;
 }
 
+/** Whether `value` is a plain object. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** The JSON value of `body`, or `undefined` if it is not JSON. */
 function parse(body: string): unknown {
   try {
     return JSON.parse(body);
@@ -113,10 +116,12 @@ function parse(body: string): unknown {
   }
 }
 
+/** Whether `status` is 2xx. */
 function isOk(status: number): boolean {
   return status >= 200 && status < 300;
 }
 
+/** Whether the metadata response announces the extension for `target`. */
 function announces(target: string, response: MetadataResponse): boolean {
   if (!isOk(response.status)) {
     return false;
@@ -136,6 +141,7 @@ function announces(target: string, response: MetadataResponse): boolean {
   }
 }
 
+/** Whether a metadata response with `status` is cached: 2xx and 404. */
 function cacheable(status: number): boolean {
   return isOk(status) || status === 404;
 }
@@ -149,15 +155,19 @@ function cacheable(status: number): boolean {
 export class ExtensionRegistry {
   readonly #announced = new Map<string, boolean>();
   readonly #pending = new Map<string, Promise<boolean>>();
+  // Changes on clear(), so a fetch that started before it does not fill the cache
+  #generation = 0;
 
   /** `true` or `false` when the target's answer is cached, `undefined` when it is not known yet. */
   known(target: string): boolean | undefined {
     return this.#announced.get(targetKey(target));
   }
 
-  /** Forget every target. */
+  /** Forget every target, and the answers of the fetches that are running. */
   clear(): void {
+    this.#generation++;
     this.#announced.clear();
+    this.#pending.clear();
   }
 
   /**
@@ -165,6 +175,7 @@ export class ExtensionRegistry {
    *
    * Concurrent first calls for the same target share one fetch.
    */
+  // skipcq: JS-0116 - async, so an invalid URL rejects instead of throwing
   async discover(target: string, fetch: MetadataFetch): Promise<boolean> {
     const key = targetKey(target);
     const cached = this.#announced.get(key);
@@ -180,6 +191,7 @@ export class ExtensionRegistry {
    * The link is followed only if {@link challengeLink} accepts it. Concurrent calls with the same link share one
    * fetch.
    */
+  // skipcq: JS-0116 - async, so an invalid URL rejects instead of throwing
   async learnFromChallenge(target: string, wwwAuthenticate: string, fetch: MetadataFetch): Promise<boolean> {
     const key = targetKey(target);
     const link = challengeLink(key, wwwAuthenticate);
@@ -196,12 +208,19 @@ export class ExtensionRegistry {
     if (pending) {
       return pending;
     }
-    const attempt = run().finally(() => this.#pending.delete(key));
+    const attempt = run().finally(() => {
+      // After clear(), the key can belong to a newer attempt
+      if (this.#pending.get(key) === attempt) {
+        this.#pending.delete(key);
+      }
+    });
     this.#pending.set(key, attempt);
     return attempt;
   }
 
+  /** Fetch the metadata at `url`, cache the answer for `key` and return whether it announces. */
   async #fetch(key: string, url: string, fetch: MetadataFetch): Promise<boolean> {
+    const generation = this.#generation;
     let response: MetadataResponse;
     try {
       response = await fetch(url);
@@ -212,6 +231,9 @@ export class ExtensionRegistry {
     const announced = announces(key, response);
     if (!cacheable(response.status)) {
       log("protected resource metadata %s returned %d", url, response.status);
+      return announced;
+    }
+    if (generation !== this.#generation) {
       return announced;
     }
     // A slower fetch of the well-known URL must not undo what a challenge's link has shown

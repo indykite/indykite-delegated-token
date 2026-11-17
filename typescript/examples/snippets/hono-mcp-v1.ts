@@ -22,8 +22,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Hono } from "hono";
-import * as z from "zod";
+import { z } from "zod";
 
+/** An MCP server with the `call_target` tool. */
 function buildServer(): McpServer {
   const server = new McpServer({ name: "sample", version: "1.0.0" });
   server.registerTool(

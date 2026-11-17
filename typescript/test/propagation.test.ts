@@ -75,12 +75,14 @@ type Sample = (relay: Relay, stateful: boolean) => Built;
 type RequestListenerOrHandler = ((req: IncomingMessage, res: ServerResponse) => void) | FetchHandler;
 
 interface NodeTransport {
-  sessionId?: string | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  sessionId?: string | undefined; // skipcq
   handleRequest: (req: IncomingMessage, res: ServerResponse, body?: unknown) => Promise<void>;
 }
 
 interface WebTransport {
-  sessionId?: string | undefined;
+  // `exactOptionalPropertyTypes`: matches the SDK types
+  sessionId?: string | undefined; // skipcq
   handleRequest: (req: Request) => Promise<Response>;
 }
 
@@ -170,6 +172,7 @@ function sessionId(stateful: boolean) {
 function sessions<T extends { sessionId?: string | undefined }>(make: () => Promise<T>) {
   const known = new Map<string, T>();
   return {
+    // skipcq: JS-0116 - async, so it returns a promise for a known session too
     find: async (id: string | null | undefined) => (id ? known.get(id) : undefined) ?? make(),
     remember: (transport: T) => {
       if (transport.sessionId) {

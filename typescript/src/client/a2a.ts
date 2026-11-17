@@ -39,11 +39,18 @@ export function announcesExtension(card: AgentCard | null | undefined): boolean 
   return card?.capabilities?.extensions.some((extension) => extension.uri === A2A_EXTENSION_URI) ?? false;
 }
 
-// Service parameters become HTTP headers, whose names ignore case
+// Service parameters become HTTP headers, whose names ignore case: the values of `name` in every case, joined as
+// `Headers` joins them
 function parameter(parameters: ServiceParameters | undefined, name: string): string | undefined {
   const wanted = name.toLowerCase();
-  const key = Object.keys(parameters ?? {}).find((candidate) => candidate.toLowerCase() === wanted);
-  return key === undefined ? undefined : parameters?.[key];
+  const values = Object.entries(parameters ?? {}).filter(([key]) => key.toLowerCase() === wanted);
+  return values.length === 0 ? undefined : values.map(([, value]) => value).join(",");
+}
+
+// The parameters without `name` in any case, so a new value does not become a second header of the same name
+function without(parameters: ServiceParameters | undefined, name: string): ServiceParameters {
+  const wanted = name.toLowerCase();
+  return Object.fromEntries(Object.entries(parameters ?? {}).filter(([key]) => key.toLowerCase() !== wanted));
 }
 
 /**
@@ -75,7 +82,10 @@ export class DelegatedTokenInterceptor implements CallInterceptor {
       });
     }
     // A copy, never the caller's options: options reused for a later call would keep this call's token
-    args.options = { ...args.options, serviceParameters: ServiceParameters.createFrom(current, ...updates) };
+    args.options = {
+      ...args.options,
+      serviceParameters: ServiceParameters.createFrom(without(current, A2A_EXTENSIONS_HEADER), ...updates),
+    };
     return Promise.resolve();
   }
 

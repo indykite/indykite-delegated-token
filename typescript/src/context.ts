@@ -23,6 +23,7 @@ const storage = new AsyncLocalStorage<string | undefined>();
 
 const HEADER = DELEGATED_TOKEN_HEADER.toLowerCase();
 
+/** `value`, or `undefined` if it is empty. */
 function nonEmpty(value: string | null | undefined): string | undefined {
   if (!value) {
     return undefined;
@@ -44,6 +45,7 @@ export function runWithToken<R>(token: string | null | undefined, fn: () => R): 
   return storage.run(nonEmpty(token), fn);
 }
 
+/** Whether `headers` is a `Headers` object, not a plain record. */
 function isHeaders(headers: HeadersLike): headers is Headers {
   return typeof headers.get === "function";
 }
@@ -56,11 +58,6 @@ export function tokenFromHeaders(headers: HeadersLike | null | undefined): strin
   if (isHeaders(headers)) {
     return nonEmpty(headers.get(HEADER));
   }
-  for (const [name, value] of Object.entries(headers)) {
-    if (name.toLowerCase() !== HEADER) {
-      continue;
-    }
-    return nonEmpty(Array.isArray(value) ? value[0] : value);
-  }
-  return undefined;
+  const value = Object.entries(headers).find(([name]) => name.toLowerCase() === HEADER)?.[1];
+  return nonEmpty(Array.isArray(value) ? value[0] : value);
 }
