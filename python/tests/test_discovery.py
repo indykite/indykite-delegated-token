@@ -21,13 +21,17 @@ import anyio.to_thread
 import pytest
 
 from indykite_delegated_token import MCP_EXTENSION_ID
+from indykite_delegated_token.client import _discovery
 from indykite_delegated_token.client._discovery import (
     ExtensionRegistry,
+    UnusableMetadata,
     challenge_link,
     metadata_url,
     resource_metadata_link,
     same_origin,
+    secure_transport,
     target_key,
+    within_origin,
 )
 
 TARGET = "https://mcp.example.com/tools/mcp"
@@ -53,6 +57,14 @@ class FakeFetch:
         if isinstance(answer, Exception):
             raise answer
         return answer
+
+
+class Clock:
+    """Replaces the registry's monotonic clock, so a test can move time forward."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.now = 0.0
+        monkeypatch.setattr(_discovery, "monotonic", lambda: self.now)
 
 
 @pytest.mark.parametrize(
@@ -106,10 +118,45 @@ async def test_query_selects_another_resource() -> None:
     assert fetch.urls == [f"{METADATA}?tenant=a", f"{METADATA}?tenant=b"]
 
 
-def test_resource_metadata_link() -> None:
-    assert resource_metadata_link('Bearer realm="x", resource_metadata="https://a/b"') == "https://a/b"
-    assert resource_metadata_link("Bearer resource_metadata=https://a/b, error=x") == "https://a/b"
-    assert resource_metadata_link('Bearer realm="x"') is None
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ('Bearer realm="x", resource_metadata="https://a/b"', "https://a/b"),
+        ("Bearer resource_metadata=https://a/b, error=x", "https://a/b"),
+        ('Bearer realm="x"', None),
+        (
+            'Bearer error_description="see resource_metadata=https://gw/x", resource_metadata="https://gw/y"',
+            "https://gw/y",
+        ),
+        ('Bearer xresource_metadata="https://gw/evil", resource_metadata="https://gw/good"', "https://gw/good"),
+        (
+            'Bearer error_description="a \\"quoted\\" resource_metadata=x", resource_metadata=https://gw/y',
+            "https://gw/y",
+        ),
+        ('Bearer resource_metadata="https://gw/a\\"b"', 'https://gw/a"b'),
+        ('Bearer resource_metadata=""', None),
+    ],
+    ids=["quoted", "token", "missing", "inside-a-value", "longer-name", "escaped-quotes", "escape", "empty"],
+)
+def test_resource_metadata_link(header: str, expected: str | None) -> None:
+    assert resource_metadata_link(header) == expected
+
+
+@pytest.mark.parametrize(
+    ("first", "url", "expected"),
+    [
+        ("https://gw.example.com/mcp", "https://gw.example.com:443/other", True),
+        ("http://gw.example.com/mcp", "https://gw.example.com/mcp", True),
+        ("http://gw.example.com:80/mcp", "https://gw.example.com:443/mcp", True),
+        ("https://gw.example.com/mcp", "http://gw.example.com/mcp", False),
+        ("http://gw.example.com:8080/mcp", "https://gw.example.com/mcp", False),
+        ("http://gw.example.com/mcp", "https://gw.example.com:8443/mcp", False),
+        ("http://gw.example.com/mcp", "https://other.example.com/mcp", False),
+        ("http://gw.example.com:bad/mcp", "https://gw.example.com/mcp", False),
+    ],
+)
+def test_within_origin(first: str, url: str, expected: bool) -> None:
+    assert within_origin(first, url) is expected
 
 
 async def test_announced() -> None:
@@ -141,13 +188,64 @@ async def test_not_announced_is_cached(answer: tuple[int, bytes]) -> None:
     assert registry.known(TARGET) is False
 
 
-@pytest.mark.parametrize("answer", [(503, b""), (401, b""), OSError("refused")], ids=["5xx", "401", "network"])
-async def test_failures_are_not_cached(answer: tuple[int, bytes] | Exception) -> None:
-    registry, fetch = ExtensionRegistry(), FakeFetch(answer, (200, prm()))
+@pytest.mark.parametrize(
+    ("answer", "ttl"),
+    [((200, prm()), 3600), ((404, b""), 3600), ((503, b""), 60), ((401, b""), 60)],
+    ids=["announced", "404", "5xx", "401"],
+)
+async def test_answers_expire(answer: tuple[int, bytes], ttl: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = Clock(monkeypatch)
+    registry, fetch = ExtensionRegistry(), FakeFetch(answer, (200, prm(announced=answer[0] != 200)))
+    first = await registry.discover(TARGET, fetch)
+    clock.now = ttl - 1
+    assert await registry.discover(TARGET, fetch) is first
+    clock.now = ttl
+    assert await registry.discover(TARGET, fetch) is not first  # the target changed its answer
+    assert len(fetch.urls) == 2
+
+
+@pytest.mark.parametrize(("answer", "ttl"), [((404, b""), 3600), ((200, prm(announced=False)), 3600), ((503, b""), 60)])
+async def test_challenge_answers_are_cached(
+    answer: tuple[int, bytes], ttl: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock(monkeypatch)
+    registry, fetch = ExtensionRegistry(), FakeFetch(answer)
+    challenge = 'Bearer resource_metadata="https://mcp.example.com/prm"'
+    assert not await registry.learn_from_challenge(TARGET, challenge, fetch)
+    clock.now = ttl - 1
+    assert not await registry.learn_from_challenge(TARGET, challenge, fetch)  # the target keeps answering 401
+    assert len(fetch.urls) == 1
+    other = 'Bearer resource_metadata="https://mcp.example.com/other"'
+    assert not await registry.learn_from_challenge(TARGET, other, fetch)  # another link is followed
+    clock.now = ttl
+    assert not await registry.learn_from_challenge(TARGET, challenge, fetch)  # and the first one again once expired
+    assert len(fetch.urls) == 3
+
+
+async def test_challenge_overrides_well_known() -> None:
+    registry = ExtensionRegistry()
+    assert not await registry.discover(TARGET, FakeFetch((404, b"")))
+    challenge = 'Bearer resource_metadata="https://mcp.example.com/prm"'
+    assert await registry.learn_from_challenge(TARGET, challenge, FakeFetch((200, prm())))
+    assert registry.known(TARGET) is True
+
+
+async def test_network_errors_are_not_cached() -> None:
+    registry, fetch = ExtensionRegistry(), FakeFetch(OSError("refused"), (200, prm()))
     assert not await registry.discover(TARGET, fetch)
     assert registry.known(TARGET) is None
     assert await registry.discover(TARGET, fetch)
     assert len(fetch.urls) == 2
+
+
+async def test_least_recently_used_targets_are_dropped() -> None:
+    registry, fetch = ExtensionRegistry(max_targets=2), FakeFetch((404, b""))
+    a, b, c = (f"https://mcp.example.com/{path}" for path in "abc")
+    await registry.discover(a, fetch)
+    await registry.discover(b, fetch)
+    assert registry.known(a) is False  # used after b
+    await registry.discover(c, fetch)
+    assert [registry.known(a), registry.known(b), registry.known(c)] == [False, None, False]
 
 
 async def test_concurrent_first_calls_fetch_once() -> None:
@@ -247,8 +345,84 @@ async def test_challenge_without_link() -> None:
     assert fetch.urls == []
 
 
-def test_clear() -> None:
+async def test_clear() -> None:
     registry = ExtensionRegistry()
-    registry._announced[target_key(TARGET)] = True
+    assert await registry.discover(TARGET, FakeFetch((200, prm())))
     registry.clear()
     assert registry.known(TARGET) is None
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://mcp.example.com/mcp", True),
+        ("http://localhost:8000/mcp", True),
+        ("http://127.0.0.2/mcp", True),
+        ("http://[::1]:8000/mcp", True),
+        ("http://mcp.example.com/mcp", False),
+        ("ftp://mcp.example.com/mcp", False),
+        ("http://mcp.example.com:bad/mcp", False),
+    ],
+)
+def test_secure_transport(url: str, expected: bool) -> None:
+    assert secure_transport(url) is expected
+
+
+async def test_unusable_answers_are_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = Clock(monkeypatch)
+    registry, fetch = ExtensionRegistry(), FakeFetch(UnusableMetadata("larger than 65536 bytes"), (200, prm()))
+    assert not await registry.discover(TARGET, fetch)
+    assert not await registry.discover(TARGET, fetch)
+    assert registry.known(TARGET) is False
+    assert fetch.urls == [METADATA]
+    clock.now = 60  # cached like an error status
+    assert await registry.discover(TARGET, fetch)
+    assert fetch.urls == [METADATA, METADATA]
+
+
+async def test_cancelled_fetch_is_not_shared() -> None:
+    registry, started, release = ExtensionRegistry(), asyncio.Event(), asyncio.Event()
+    urls: list[str] = []
+
+    async def fetch(url: str) -> tuple[int, bytes]:
+        urls.append(url)
+        started.set()
+        await release.wait()
+        return 200, prm()
+
+    leader = asyncio.create_task(registry.discover(TARGET, fetch))
+    await started.wait()
+    waiters = [asyncio.create_task(registry.discover(TARGET, fetch)) for _ in range(3)]
+    await asyncio.sleep(0)
+    leader.cancel()
+    release.set()
+    async with asyncio.timeout(5):
+        assert await asyncio.gather(*waiters) == [True, True, True]
+    assert leader.cancelled()
+    assert urls == [METADATA, METADATA]  # the first waiter fetched again, the others shared its fetch
+
+
+async def test_logs_leave_out_the_query(caplog: pytest.LogCaptureFixture) -> None:
+    _discovery._warn_ignored_link.cache_clear()  # each link is logged once per process
+    registry = ExtensionRegistry()
+    target = f"{TARGET}?api_key=SECRET"
+    await registry.discover(target, FakeFetch((500, b"")))
+    await registry.discover(f"{target}&x=1", FakeFetch(OSError("refused")))
+    await registry.discover(f"{target}&x=2", FakeFetch(UnusableMetadata("compressed")))
+    challenge = 'Bearer resource_metadata="https://evil.example.com/prm?api_key=SECRET"'
+    await registry.learn_from_challenge(target, challenge, FakeFetch((200, prm())))
+    assert len(caplog.records) == 4
+    assert "SECRET" not in caplog.text
+    assert METADATA in caplog.text
+
+
+async def test_ignored_link_is_logged_once(caplog: pytest.LogCaptureFixture) -> None:
+    _discovery._warn_ignored_link.cache_clear()  # each link is logged once per process
+    registry, fetch = ExtensionRegistry(), FakeFetch((200, prm()))
+    challenge = 'Bearer resource_metadata="https://elsewhere.example.com/prm"'
+    for _ in range(3):
+        assert not await registry.learn_from_challenge(TARGET, challenge, fetch)
+    other = 'Bearer resource_metadata="https://elsewhere.example.com/other"'
+    assert not await registry.learn_from_challenge(TARGET, other, fetch)
+    assert [record.levelname for record in caplog.records] == ["WARNING", "WARNING"]
+    assert fetch.urls == []

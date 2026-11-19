@@ -27,6 +27,7 @@ from indykite_delegated_token.client._transport_core import (
     METADATA_HEADERS,
     Replay,
     WrappingTransport,
+    environment_proxies,
     handle,
     metadata_timeout,
     read_raw,
@@ -109,14 +110,25 @@ def http_client(
     """An ``httpx.AsyncClient`` that propagates the delegated token, with the MCP SDK's default timeouts.
 
     The signature matches the MCP SDK's ``McpHttpClientFactory``, and FastMCP's use of it, so it can be passed as
-    ``httpx_client_factory``. Pass ``transport`` to configure TLS, proxies or limits of the underlying transport.
+    ``httpx_client_factory``. Without ``transport``, requests go through the proxies of ``HTTP_PROXY``,
+    ``HTTPS_PROXY``, ``ALL_PROXY`` and ``NO_PROXY``, as with the SDK's own client. Pass ``transport`` to configure
+    TLS, proxies or limits of the underlying transport: then the environment's proxies are not used.
     """
+    mounts: dict[str, httpx.AsyncBaseTransport | None] = {}
+    if transport is None:
+        mounts = {
+            pattern: None
+            if proxy is None
+            else DelegatedTokenTransport(httpx.AsyncHTTPTransport(proxy=proxy), registry=registry)
+            for pattern, proxy in environment_proxies().items()
+        }
     return httpx.AsyncClient(
         headers=headers,
         timeout=timeout if timeout is not None else _DEFAULT_TIMEOUT,
         auth=auth,
         follow_redirects=follow_redirects,
         transport=DelegatedTokenTransport(transport, registry=registry),
+        mounts=mounts,
     )
 
 

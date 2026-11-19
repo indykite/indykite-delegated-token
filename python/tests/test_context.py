@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+from starlette.datastructures import Headers
 
 from indykite_delegated_token import get_delegated_token, use_token
 from indykite_delegated_token._context import token_from_headers
@@ -48,6 +49,8 @@ def test_empty_token_is_none() -> None:
         ({"x-ik-token": "b"}, "b"),
         ({"X-Ik-Token": "c"}, "c"),
         ({"x-ik-token": ""}, None),
+        (Headers(raw=[(b"x-ik-token", b"a"), (b"x-ik-token", b"b")]), None),
+        ({"x-ik-token": "a, b"}, None),
         ({}, None),
         (None, None),
     ],

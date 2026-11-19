@@ -21,6 +21,11 @@ extension. A gateway that announces the extension needs nothing else: the token 
 Environment:
     TARGET_MCP_URL          MCP endpoint that ``call_mcp_tool`` calls, through its gateway
     TARGET_AGENT_URL        base URL of the A2A agent that ``ask_agent`` calls, through its gateway
+    ALLOW_HTTP              set to 1 to also send the token over plain HTTP, such as to a gateway in a private
+                            network; by default it only goes over https, or http to a loopback host
+    ALLOWED_HOSTS           comma-separated Host headers that this server accepts, such as ``sample-mcp:*``, to
+                            protect it against DNS rebinding; by default every Host is accepted, as behind the
+                            gateway, which reaches the server by a name of its own
     HOST, PORT              where this server listens (default 0.0.0.0:8000)
 """
 
@@ -30,16 +35,23 @@ import uuid
 import httpx
 import uvicorn
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
-from a2a.types.a2a_pb2 import ROLE_USER, Message, Part, SendMessageRequest
+from a2a.types.a2a_pb2 import ROLE_USER, TASK_STATE_COMPLETED, Message, Part, SendMessageRequest, TaskState
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 from indykite_delegated_token import install
+from indykite_delegated_token.client import ExtensionRegistry
 from indykite_delegated_token.client.a2a import DelegatedTokenInterceptor
 from indykite_delegated_token.client.httpx2 import http_client
+
+ALLOW_HTTP = os.environ.get("ALLOW_HTTP") == "1"
+ALLOWED_HOSTS = [host.strip() for host in os.environ.get("ALLOWED_HOSTS", "").split(",") if host.strip()]
+REGISTRY = ExtensionRegistry(allow_http=ALLOW_HTTP)  # one for the process, so the targets' answers are cached
 
 server = MCPServer("sample-mcp-server")
 install(server)  # the tools see the delegated token of the request they handle
@@ -49,7 +61,7 @@ install(server)  # the tools see the delegated token of the request they handle
 async def call_mcp_tool(tool: str, arguments: dict[str, object] | None = None) -> str:
     """Call a tool of the MCP server at TARGET_MCP_URL and return its text output."""
     async with (
-        http_client() as client,  # adds X-IK-Token if the target announces
+        http_client(registry=REGISTRY) as client,  # adds X-IK-Token if the target announces
         streamable_http_client(os.environ["TARGET_MCP_URL"], http_client=client) as (read, write),
         ClientSession(read, write) as session,
     ):
@@ -65,7 +77,9 @@ async def ask_agent(text: str) -> str:
         card = await A2ACardResolver(http, os.environ["TARGET_AGENT_URL"]).get_agent_card()
         client = ClientFactory(ClientConfig(streaming=False, httpx_client=http)).create(
             card,
-            interceptors=[DelegatedTokenInterceptor()],  # adds X-IK-Token if the card lists the extension
+            interceptors=[
+                DelegatedTokenInterceptor(allow_http=ALLOW_HTTP)
+            ],  # adds X-IK-Token if the card lists the extension
         )
         request = SendMessageRequest(
             message=Message(role=ROLE_USER, message_id=str(uuid.uuid4()), parts=[Part(text=text)])
@@ -75,6 +89,9 @@ async def ask_agent(text: str) -> str:
             if response.HasField("message"):
                 replies.extend(part.text for part in response.message.parts)
             elif response.HasField("task"):
+                state = response.task.status.state
+                if state != TASK_STATE_COMPLETED:  # a failed or unfinished task has no answer to return
+                    raise RuntimeError(f"task {response.task.id} of the agent ended in {TaskState.Name(state)}")
                 for artifact in response.task.artifacts:
                     replies.extend(part.text for part in artifact.parts)
     return "\n".join(replies)
@@ -86,9 +103,19 @@ async def healthz(_: Request) -> PlainTextResponse:
     return PlainTextResponse("ok")
 
 
+def app() -> Starlette:
+    """The ASGI app. The SDK's default accepts only loopback Host headers, which would refuse the gateway's requests."""
+    return server.streamable_http_app(
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=bool(ALLOWED_HOSTS),
+            allowed_hosts=ALLOWED_HOSTS,
+        ),
+    )
+
+
 if __name__ == "__main__":
     uvicorn.run(
-        server.streamable_http_app(),
+        app(),
         host=os.environ.get("HOST", "0.0.0.0"),  # nosec B104 - listens in a container
         port=int(os.environ.get("PORT", "8000")),
     )

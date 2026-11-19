@@ -111,6 +111,27 @@ async def test_not_announced_target_gets_nothing(lib: tuple[ModuleType, ModuleTy
     assert response.json() == {"seen": None}
 
 
+@pytest.mark.parametrize(("allow_http", "expected"), [(False, None), (True, "tok")])
+async def test_plain_http_needs_allow_http(
+    lib: tuple[ModuleType, ModuleType], allow_http: bool, expected: str | None
+) -> None:
+    http, adapter = lib
+    url, urls = "http://mcp.example.com/mcp", []
+
+    def target(request: Any) -> Any:
+        urls.append(str(request.url))
+        if "/.well-known/" in str(request.url):
+            return http.Response(200, json={"resource": url, "mcp_extensions": {MCP_EXTENSION_ID: {}}})
+        return http.Response(200, json={"seen": request.headers.get("X-IK-Token")})
+
+    registry = ExtensionRegistry(allow_http=allow_http)
+    async with adapter.http_client(transport=http.MockTransport(target), registry=registry) as c:
+        with use_token("tok"):
+            response = await c.post(url, content=b"{}")
+    assert response.json() == {"seen": expected}
+    assert len(urls) == (2 if allow_http else 1)  # without allow_http, not even the metadata is fetched
+
+
 async def test_caller_header_is_kept(lib: tuple[ModuleType, ModuleType]) -> None:
     target = Target()
     async with client(lib, target) as c:
@@ -266,6 +287,30 @@ async def test_redirect_to_announcing_target(
     assert seen == {TARGET: "tok", location: expected}
 
 
+async def test_redirect_to_https_keeps_the_token(lib: tuple[ModuleType, ModuleType]) -> None:
+    http, adapter = lib
+    plain = TARGET.replace("https://", "http://")
+    seen: dict[str, str | None] = {}
+
+    def answer(request: Any) -> Any:
+        url = str(request.url)
+        if "/.well-known/oauth-protected-resource" in url:
+            resource = url.replace("/.well-known/oauth-protected-resource", "")
+            return http.Response(200, json={"resource": resource, "mcp_extensions": {MCP_EXTENSION_ID: {}}})
+        seen[url] = request.headers.get("X-IK-Token")
+        if url == plain:
+            return http.Response(308, headers={"Location": TARGET})
+        return http.Response(200)
+
+    registry = ExtensionRegistry(allow_http=True)
+    transport = http.MockTransport(answer)
+    async with adapter.http_client(transport=transport, registry=registry, follow_redirects=True) as c:
+        with use_token("tok"):
+            response = await c.post(plain, content=b"{}")
+    assert response.status_code == 200
+    assert seen == {plain: "tok", TARGET: "tok"}
+
+
 async def test_caller_request_is_not_changed(lib: tuple[ModuleType, ModuleType]) -> None:
     target = Target()
     async with client(lib, target) as c:
@@ -359,17 +404,20 @@ async def test_streamed_401_is_returned_intact(lib: tuple[ModuleType, ModuleType
 async def test_large_metadata_is_refused(lib: tuple[ModuleType, ModuleType]) -> None:
     http, _ = lib
     padding = "x" * MAX_BODY
+    fetched: list[str] = []
 
     def answer(request: Any) -> Any:
         if str(request.url) == METADATA:
+            fetched.append(METADATA)
             body = {"resource": TARGET, "mcp_extensions": {MCP_EXTENSION_ID: {}}, "padding": padding}
             return http.Response(200, json=body)
         return http.Response(200, json={"seen": request.headers.get("X-IK-Token")})
 
     async with client(lib, answer) as c:  # type: ignore[arg-type]
         with use_token("tok"):
-            response = await c.post(TARGET, content=b"{}")
-    assert response.json() == {"seen": None}
+            responses = [await c.post(TARGET, content=b"{}") for _ in range(3)]
+    assert [response.json() for response in responses] == [{"seen": None}] * 3
+    assert fetched == [METADATA]  # an answer, cached as not announced
 
 
 async def test_compressed_metadata_is_refused(lib: tuple[ModuleType, ModuleType]) -> None:
@@ -433,16 +481,21 @@ async def test_metadata_fetch_has_a_deadline(
                 await asyncio.sleep(0.01)
                 yield b" "
 
+    fetched: list[str] = []
+
     def answer(request: Any) -> Any:
         if str(request.url) == METADATA:
+            fetched.append(METADATA)
             return http.Response(200, stream=Trickle())
         return http.Response(200, json={"seen": request.headers.get("X-IK-Token")})
 
     async with client(lib, answer) as c:  # type: ignore[arg-type]
         with use_token("tok"):
             async with asyncio.timeout(5):
-                response = await c.post(TARGET, content=b"{}")
-    assert response.json() == {"seen": None}
+                first = await c.post(TARGET, content=b"{}")
+                second = await c.post(TARGET, content=b"{}")
+    assert first.json() == second.json() == {"seen": None}
+    assert fetched == [METADATA]  # the next call does not wait for it again
 
 
 async def test_http_client_defaults(lib: tuple[ModuleType, ModuleType]) -> None:
@@ -470,3 +523,32 @@ async def test_transport_closes_inner(lib: tuple[ModuleType, ModuleType]) -> Non
         pass
     await transport.aclose()
     assert closed == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("url", "proxied"),
+    [("https://gw.example.com/mcp", True), ("https://internal.example.com/mcp", False)],
+)
+async def test_http_client_uses_environment_proxies(
+    lib: tuple[ModuleType, ModuleType], monkeypatch: pytest.MonkeyPatch, url: str, proxied: bool
+) -> None:
+    http, adapter = lib
+    for name in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "internal.example.com,localhost")
+    async with adapter.http_client() as c:
+        transport = c._transport_for_url(http.URL(url))
+    assert isinstance(transport, adapter.DelegatedTokenTransport)  # proxied or not, the token is handled
+    assert ("Proxy" in type(transport._transport._pool).__name__) is proxied
+
+
+async def test_http_client_with_transport_ignores_environment_proxies(
+    lib: tuple[ModuleType, ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    http, adapter = lib
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    inner = http.MockTransport(lambda request: http.Response(200))
+    async with adapter.http_client(transport=inner) as c:
+        transport = c._transport_for_url(http.URL("https://gw.example.com/mcp"))
+    assert transport._transport is inner

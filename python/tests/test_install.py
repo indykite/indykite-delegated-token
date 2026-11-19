@@ -79,7 +79,15 @@ def test_mcp_v1_wraps_every_handler(kind: str) -> None:
     async def prompts() -> list[object]:
         return []
 
+    async def plain(_: object) -> None: ...
+
+    class Updated: ...
+
+    class Defaulted: ...
+
     handlers = lowlevel.request_handlers
+    handlers.update({Updated: plain})
+    handlers.setdefault(Defaulted, plain)
     assert types.ListPromptsRequest in handlers
     assert all(getattr(h, "__indykite_delegated_token__", False) for h in handlers.values())
     assert not hasattr(getattr(handlers[types.PingRequest], "__wrapped__", None), "__indykite_delegated_token__")

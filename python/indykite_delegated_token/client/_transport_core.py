@@ -16,13 +16,21 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from functools import partial
 from types import TracebackType
 from typing import Any, Protocol, Self, TypeVar
 
 from indykite_delegated_token._constants import DELEGATED_TOKEN_HEADER
 from indykite_delegated_token._context import get_delegated_token
-from indykite_delegated_token.client._discovery import ExtensionRegistry, challenge_link, same_origin
+from indykite_delegated_token.client._discovery import (
+    ExtensionRegistry,
+    UnusableMetadata,
+    challenge_link,
+    secure_transport,
+    within_origin,
+)
 
 __all__ = [
     "MAX_BODY",
@@ -30,6 +38,7 @@ __all__ = [
     "READ_DEADLINE",
     "Replay",
     "WrappingTransport",
+    "environment_proxies",
     "handle",
     "metadata_timeout",
     "read_raw",
@@ -75,12 +84,14 @@ class _Response(Protocol):
 
 class _Transport(Protocol):
     async def __aenter__(self) -> Any: ...  # noqa: ANN401 - the transport itself
+
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None = None,
         exc_value: BaseException | None = None,
         traceback: TracebackType | None = None,
     ) -> None: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -104,6 +115,39 @@ def _replayable(request: _Request) -> bool:
     except Exception:
         return False
     return True
+
+
+def environment_proxies() -> dict[str, str | None]:
+    """The proxies of ``HTTP_PROXY``, ``HTTPS_PROXY``, ``ALL_PROXY`` and ``NO_PROXY``, as httpx mount patterns.
+
+    The same as httpx's for a client without a transport: each pattern maps to a proxy URL, or to ``None`` for the
+    hosts that ``NO_PROXY`` sends directly.
+    """
+    from urllib.request import getproxies
+
+    proxies = getproxies()
+    mounts: dict[str, str | None] = {}
+    for scheme in ("http", "https", "all"):
+        if proxy := proxies.get(scheme):
+            mounts[f"{scheme}://"] = proxy if "://" in proxy else f"http://{proxy}"
+    for host in (host.strip() for host in proxies.get("no", "").split(",")):
+        if host == "*":
+            return {}
+        if not host:
+            continue
+        try:
+            version = ipaddress.ip_address(host).version
+        except ValueError:
+            version = None
+        if "://" in host:
+            mounts[host] = None
+        elif version == 6:  # noqa: PLR2004 - the IP version
+            mounts[f"all://[{host}]"] = None
+        elif version == 4 or host.lower() == "localhost":  # noqa: PLR2004 - the IP version
+            mounts[f"all://{host}"] = None
+        else:  # a domain and its subdomains
+            mounts[f"all://*{host}"] = None
+    return mounts
 
 
 def metadata_timeout(request: _Request) -> dict[str, Any]:
@@ -194,6 +238,48 @@ class WrappingTransport:
         await self._transport.aclose()
 
 
+def _token_for(request: _Request, target: str, first_url: str, registry: ExtensionRegistry) -> str | None:
+    """The token ``request`` may carry if its target announces, or ``None`` when it must go out unchanged."""
+    token = get_delegated_token()
+    if token is None or DELEGATED_TOKEN_HEADER in request.headers:
+        return None
+    if not within_origin(first_url, target):
+        # A redirect to another origin, or from https to http: the token only goes where the caller sent the request,
+        # or to its https upgrade, never where a server sends it on, even if that announces the extension
+        return None
+    if not registry.allow_http and not secure_transport(target):
+        return None  # neither the token nor the metadata that announces it would be protected
+    return token
+
+
+async def _fetch_metadata(
+    send: Callable[[Req], Awaitable[Resp]],
+    make_get: Callable[[str, Req], Req],
+    buffer: Buffer[Resp],
+    request: Req,
+    url: str,
+) -> tuple[int, bytes]:
+    """Fetch the metadata at ``url`` for ``request``, see :data:`Fetch`."""
+    import anyio
+
+    try:
+        with anyio.fail_after(READ_DEADLINE):
+            response = await send(make_get(url, request))
+            try:
+                encoding = response.headers.get("content-encoding")
+                if encoding and encoding.lower() != "identity":  # asked for identity: a compressed body is unbounded
+                    raise UnusableMetadata(f"unexpected content encoding {encoding}")
+                response, complete = await buffer(response, MAX_BODY, READ_DEADLINE)
+                if not complete:
+                    raise UnusableMetadata(f"larger than {MAX_BODY} bytes")
+                return response.status_code, await response.aread()
+            finally:
+                with anyio.CancelScope(shield=True):  # give the connection back, also after the deadline
+                    await response.aclose()
+    except TimeoutError as exc:
+        raise UnusableMetadata(f"not answered within {READ_DEADLINE} seconds") from exc
+
+
 async def handle(
     request: Req,
     *,
@@ -216,31 +302,11 @@ async def handle(
     """
     target = str(request.url)
     first_url = str(request.extensions.setdefault(_FIRST_URL, target))
-    token = get_delegated_token()
-    if token is None or DELEGATED_TOKEN_HEADER in request.headers:
-        return await send(request)
-    if not same_origin(first_url, target):
-        # A redirect to another origin, or from https to http: the token only goes where the caller sent the request,
-        # never where a server sends it on, even if that announces the extension
+    token = _token_for(request, target, first_url, registry)
+    if token is None:
         return await send(request)
 
-    async def fetch(url: str) -> tuple[int, bytes]:
-        import anyio
-
-        with anyio.fail_after(READ_DEADLINE):
-            response = await send(make_get(url, request))
-            try:
-                encoding = response.headers.get("content-encoding")
-                if encoding and encoding.lower() != "identity":  # asked for identity: a compressed body is unbounded
-                    raise ValueError(f"unexpected content encoding {encoding}")
-                response, complete = await buffer(response, MAX_BODY, READ_DEADLINE)
-                if not complete:
-                    raise ValueError(f"larger than {MAX_BODY} bytes")
-                return response.status_code, await response.aread()
-            finally:
-                with anyio.CancelScope(shield=True):  # give the connection back, also after the deadline
-                    await response.aclose()
-
+    fetch = partial(_fetch_metadata, send, make_get, buffer, request)
     if await registry.discover(target, fetch):
         return await send(with_header(request, DELEGATED_TOKEN_HEADER, token))
 

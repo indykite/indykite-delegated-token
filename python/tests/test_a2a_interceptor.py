@@ -55,6 +55,25 @@ async def test_adds_token_and_extension_without_context() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("url", "allow_http", "sent"),
+    [
+        ("https://agent.example.com/", False, True),
+        ("http://127.0.0.1:8000/", False, True),
+        ("http://agent.example.com/", False, False),
+        ("http://agent.example.com/", True, True),
+    ],
+)
+async def test_plain_http_agent(url: str, allow_http: bool, sent: bool) -> None:
+    agent_card = card(A2A_EXTENSION_URI)
+    agent_card.supported_interfaces.add(url="https://agent.example.com/", protocol_binding="JSONRPC")
+    agent_card.supported_interfaces.add(url=url, protocol_binding="HTTP+JSON")
+    before = args(agent_card)
+    with use_token("tok"):
+        await DelegatedTokenInterceptor(allow_http=allow_http).before(before)
+    assert (before.context is not None) is sent
+
+
 async def test_merges_with_existing_extensions() -> None:
     context = ClientCallContext(service_parameters={A2A_EXTENSIONS_HEADER: OTHER_URI, "Other": "x"})
     before = args(card(A2A_EXTENSION_URI), context)
@@ -118,3 +137,47 @@ async def test_after_does_nothing() -> None:
     after = AfterArgs(result="r", method="send_message", agent_card=card())
     await DelegatedTokenInterceptor().after(after)
     assert after.result == "r"
+
+
+@pytest.mark.parametrize(
+    ("url", "binding", "sent"),
+    [
+        ("agent.example.com:443", "GRPC", True),
+        ("dns:///agent.example.com:443", "GRPC", True),
+        ("http://agent.example.com/", "", False),
+    ],
+    ids=["grpc", "grpc-dns", "unknown-binding"],
+)
+async def test_grpc_interface(url: str, binding: str, sent: bool) -> None:
+    agent_card = card(A2A_EXTENSION_URI)
+    agent_card.supported_interfaces.add(url="https://agent.example.com/a2a", protocol_binding="JSONRPC")
+    agent_card.supported_interfaces.add(url=url, protocol_binding=binding)
+    before = args(agent_card)
+    with use_token("tok"):
+        await DelegatedTokenInterceptor().before(before)
+    assert (before.context is not None) is sent
+
+
+async def test_redirect_is_not_followed_with_the_token() -> None:
+    import httpx
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.client.errors import A2AClientError
+    from a2a.types.a2a_pb2 import ROLE_USER, Message, Part, SendMessageRequest
+
+    seen: dict[str, str | None] = {}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        seen[str(request.url)] = request.headers.get(DELEGATED_TOKEN_HEADER)
+        return httpx.Response(307, headers={"Location": "https://other.example.net/a2a"})
+
+    agent_card = card(A2A_EXTENSION_URI)
+    agent_card.supported_interfaces.add(url="https://agent.example.com/a2a", protocol_binding="JSONRPC")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as http:  # follow_redirects=False
+        client = ClientFactory(ClientConfig(streaming=False, httpx_client=http)).create(
+            agent_card, interceptors=[DelegatedTokenInterceptor()]
+        )
+        request = SendMessageRequest(message=Message(role=ROLE_USER, message_id="1", parts=[Part(text="hi")]))
+        with use_token("tok"), pytest.raises(A2AClientError):  # the 307 is not followed
+            async for _ in client.send_message(request):
+                pass
+    assert seen == {"https://agent.example.com/a2a": "tok"}

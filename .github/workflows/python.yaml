@@ -83,7 +83,7 @@ jobs:
         run: uv run --no-sync pytest --cov --cov-report xml
 
       - name: Build package
-        if: matrix.sdk == 'mcp2'
+        if: matrix.sdk == 'mcp2' && matrix.python-version == '3.14' # the package is the same on every Python version
         run: uv build
 
       - name: codecov/upload-coverage

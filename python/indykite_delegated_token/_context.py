@@ -14,11 +14,14 @@
 
 """The delegated token of the request being handled."""
 
+import logging
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 from indykite_delegated_token._constants import DELEGATED_TOKEN_HEADER
+
+logger = logging.getLogger(__name__)
 
 _delegated_token: ContextVar[str | None] = ContextVar("indykite_delegated_token", default=None)
 
@@ -48,15 +51,20 @@ def _text(value: object) -> object:
 def token_in(pairs: Iterable[tuple[object, object]]) -> str | None:
     """The delegated token in header ``(name, value)`` pairs, case-insensitively, as ``str`` or latin-1 ``bytes``.
 
-    Returns ``None`` when the header is missing or empty.
+    Returns ``None`` when the header is missing or empty, and when it has several values, as several headers or one
+    joined with commas: a proxy may have appended a header to one the caller forged, so neither is used.
     """
     wanted = DELEGATED_TOKEN_HEADER.lower()
+    values = []
     for name, value in pairs:
-        name = _text(name)
-        if isinstance(name, str) and name.lower() == wanted:
-            value = _text(value)
-            return value if isinstance(value, str) and value else None
-    return None
+        name, value = _text(name), _text(value)
+        if isinstance(name, str) and name.lower() == wanted and isinstance(value, str):
+            values.append(value)
+    token = ",".join(values)
+    if "," in token:
+        logger.warning("ignoring the %s header, which has several values", DELEGATED_TOKEN_HEADER)
+        return None
+    return token or None
 
 
 def token_from_headers(headers: object) -> str | None:
