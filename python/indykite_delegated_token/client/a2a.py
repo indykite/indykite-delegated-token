@@ -22,6 +22,7 @@ from a2a.client.service_parameters import ServiceParametersFactory, with_a2a_ext
 
 from indykite_delegated_token._constants import A2A_EXTENSION_URI, DELEGATED_TOKEN_HEADER
 from indykite_delegated_token._context import get_delegated_token
+from indykite_delegated_token.client._discovery import secure_transport
 
 __all__ = ["DelegatedTokenInterceptor", "announces_extension"]
 
@@ -40,12 +41,21 @@ class DelegatedTokenInterceptor(ClientCallInterceptor):
     delegated token, and calls to agents whose card does not list the extension, are left unchanged. A token the
     caller already set is kept.
 
+    The card is trusted as given: a2a-sdk tells the interceptor neither where it came from nor which of its interfaces
+    the call uses. The token only goes to agents whose interfaces all pass :func:`secure_transport`, unless
+    ``allow_http``.
+
     Pass it to ``ClientFactory.create(card, interceptors=[DelegatedTokenInterceptor()])``.
     """
 
-    async def before(self, args: BeforeArgs) -> None:  # skipcq: PYL-R0201 - overrides ClientCallInterceptor.before
+    def __init__(self, *, allow_http: bool = False) -> None:
+        self._allow_http = allow_http
+
+    async def before(self, args: BeforeArgs) -> None:
         token = get_delegated_token()
-        if token is None or not announces_extension(args.agent_card):
+        interfaces = getattr(args.agent_card, "supported_interfaces", None) or ()
+        secure = self._allow_http or all(secure_transport(getattr(i, "url", "")) for i in interfaces)
+        if token is None or not secure or not announces_extension(args.agent_card):
             return
         context = args.context if args.context is not None else ClientCallContext()
         updates = [with_a2a_extensions([A2A_EXTENSION_URI])]

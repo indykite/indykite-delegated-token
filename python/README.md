@@ -51,7 +51,9 @@ async def whoami() -> str:
 ```
 
 The token is read from the HTTP request of each MCP message, also in stateful sessions, whose messages are not
-handled within their own HTTP request. Two concurrent requests always see their own tokens.
+handled within their own HTTP request. Two concurrent requests always see their own tokens. A request with more than
+one `X-IK-Token` value, as several headers or one joined with commas, gets no token: a proxy may have appended the
+real one to one the caller forged.
 
 For other ASGI apps, such as A2A agents built with a2a-sdk, wrap the app in the ASGI middleware:
 
@@ -144,14 +146,22 @@ A request carries `X-IK-Token` only when there is a token and the target announc
   client fetches `/.well-known/oauth-protected-resource<path>` on the target's origin, without any credentials, with
   the client's timeouts, or 10 seconds for those it leaves unset, and 30 seconds in all. An answer larger than
   64 KiB does not count.
-- The answer is cached per target (scheme, host, port, path and query) for the life of the process; concurrent first
-  calls share one fetch. A 404 is cached as "does not announce". Network errors and other statuses are not cached,
-  and the calls that shared that fetch go out without the token.
+- The answer is cached per target (scheme, host, port, path and query) for an hour, so a target that stops announcing
+  stops getting the token; concurrent first calls share one fetch. A 404 is cached as "does not announce". Other
+  statuses, such as 401 or 5xx, count as "does not announce" for a minute. Network errors are not cached, and the
+  calls that shared that fetch go out without the token. At most 1024 targets are kept, the least recently used are
+  dropped first. `ExtensionRegistry(ttl=..., error_ttl=..., max_targets=...)` changes these.
 - When a target that is not known to announce answers 401 with `WWW-Authenticate: Bearer resource_metadata="…"`, the
   client follows the link, only if it is on the target's origin, and retries the request once with the token if the
-  target announces. A 401 whose body is larger than 64 KiB is returned as it is, without following the link; one
+  target announces. The link's answer is cached like the well-known one, so it is not followed again on every 401.
+  A 401 whose body is larger than 64 KiB is returned as it is, without following the link; one
   whose body takes more than 30 seconds to arrive fails the call with a read timeout.
-- **A2A agents** announce in their agent card, see above.
+- **A2A agents** announce in their agent card, see above. The card is trusted as given: a2a-sdk does not tell the
+  interceptor where the card came from, so resolve cards only from agents your server's operator configured.
+- The token only goes over `https`, or over `http` to a loopback host (`localhost`, `127.0.0.0/8`, `::1`): over plain
+  HTTP anyone on the network could read it, or forge the metadata that announces the extension. To send it over plain
+  HTTP anyway, for example inside a private network, pass `registry=ExtensionRegistry(allow_http=True)` to the MCP
+  client, and `allow_http=True` to `DelegatedTokenInterceptor`.
 - A token the caller set itself is never replaced.
 - When the client follows redirects, the token only goes to the origin of the first request: a redirect to another
   origin, or from `https` to `http`, never gets it, even if its target announces.

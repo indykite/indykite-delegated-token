@@ -20,10 +20,14 @@ A target is an MCP endpoint. It announces the extension in its OAuth protected r
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -39,6 +43,7 @@ __all__ = [
     "challenge_link",
     "metadata_url",
     "same_origin",
+    "secure_transport",
     "target_key",
 ]
 
@@ -79,6 +84,21 @@ def same_origin(a: str, b: str) -> bool:
     try:
         return _origin(a) == _origin(b)
     except ValueError:  # e.g. a port that is not a number
+        return False
+
+
+def secure_transport(url: str) -> bool:
+    """Whether ``url`` is ``https``, or ``http`` to a loopback host.
+
+    Over plain HTTP to another host, anyone on the network could read the token, or forge the metadata that announces
+    the extension.
+    """
+    try:
+        scheme, host, _ = _origin(url)
+        return scheme == "https" or (
+            scheme == "http" and (host == "localhost" or ipaddress.ip_address(host).is_loopback)
+        )
+    except ValueError:  # an unparsable URL, or a host name that is not an IP address
         return False
 
 
@@ -146,25 +166,60 @@ class _Attempt:
 
 
 class ExtensionRegistry:
-    """Remembers which targets announce the extension, for the life of the process.
+    """Remembers which targets announce the extension, and to which the token may go.
 
-    Answers of the metadata endpoint, 2xx and 404, are cached. Network errors and other statuses are not, so the next
-    call to the target tries again. A target that is known to announce is never downgraded.
+    Answers of the metadata endpoint, 2xx and 404, are cached for ``ttl`` seconds; other statuses, such as 401 or 5xx,
+    count as not announced for ``error_ttl`` seconds; network errors are not cached. While its entry lasts, a target
+    known to announce is not downgraded. The ``max_targets`` most recently used targets are kept. The token only goes
+    to targets that pass :func:`secure_transport`, unless ``allow_http``, for example inside a private network.
     """
 
-    def __init__(self) -> None:
-        self._announced: dict[str, bool] = {}
+    def __init__(
+        self, *, ttl: float = 3600.0, error_ttl: float = 60.0, max_targets: int = 1024, allow_http: bool = False
+    ) -> None:
+        self.allow_http = allow_http
+        self._ttl = ttl
+        self._error_ttl = error_ttl
+        self._max_targets = max_targets
+        # Target key, or (target key, challenge link) -> (announced, expiry on the monotonic clock), least recently
+        # used first
+        self._announced: OrderedDict[str | tuple[str, str], tuple[bool, float]] = OrderedDict()
+        self._lock = threading.Lock()  # the registry may be shared by clients running in different threads
         # Fetches in progress, per event loop: an event can only be awaited in the loop it belongs to, and the
         # registry may be shared by clients running in different threads, each with its own loop
         self._attempts: dict[tuple[object, ...], _Attempt] = {}
 
     def known(self, target: str) -> bool | None:
         """``True`` or ``False`` when the target's answer is cached, ``None`` when it is not known yet."""
-        return self._announced.get(target_key(target))
+        return self._get(target_key(target))
 
     def clear(self) -> None:
         """Forget every target."""
-        self._announced.clear()
+        with self._lock:
+            self._announced.clear()
+
+    def _get(self, key: str | tuple[str, str]) -> bool | None:
+        with self._lock:
+            entry = self._announced.get(key)
+            if entry is None:
+                return None
+            if monotonic() >= entry[1]:
+                del self._announced[key]
+                return None
+            self._announced.move_to_end(key)
+            return entry[0]
+
+    def _set(self, key: str | tuple[str, str], announced: bool, ttl: float) -> None:
+        with self._lock:
+            entry = self._announced.get(key)
+            # A slower fetch of the well-known URL must not undo what a challenge's link has shown; checked under the
+            # same lock as the write, so another thread's positive answer cannot land in between
+            if not announced and entry is not None and entry[0] and monotonic() < entry[1]:
+                return
+            self._announced[key] = (announced, monotonic() + ttl)
+            self._announced.move_to_end(key)
+            while len(self._announced) > self._max_targets:
+                self._announced.popitem(last=False)
 
     async def _shared(self, what: tuple[str, ...], run: Callable[[], Awaitable[bool]]) -> bool:
         # Callers that arrive while a fetch is in progress wait for it and take its result, also a failure, rather
@@ -191,26 +246,30 @@ class ExtensionRegistry:
         calls that shared it only.
         """
         key = target_key(target)
-        cached = self._announced.get(key)
+        cached = self._get(key)
         if cached is not None:
             return cached
-        return await self._shared(("metadata", key), lambda: self._fetch(key, metadata_url(key), fetch))
+        return await self._shared(("metadata", key), lambda: self._fetch(metadata_url(key), fetch, key))
 
     async def learn_from_challenge(self, target: str, www_authenticate: str, fetch: Fetch) -> bool:
         """Follow the ``resource_metadata`` link of a 401 and return whether ``target`` announces now.
 
         The link is followed only if :func:`challenge_link` accepts it. Concurrent calls with the same link share one
-        fetch.
+        fetch, and its answer is cached like that of the well-known URL, so a target that keeps answering 401 does not
+        make every request follow the link again.
         """
         key = target_key(target)
         link = challenge_link(key, www_authenticate)
         if link is None:
-            return self._announced.get(key, False)
-        if self._announced.get(key):
+            return bool(self._get(key))
+        if self._get(key):
             return True
-        return await self._shared(("challenge", key, link), lambda: self._fetch(key, link, fetch))
+        if self._get((key, link)) is False:  # the link was followed recently and did not announce
+            return False
+        return await self._shared(("challenge", key, link), lambda: self._fetch(link, fetch, key, (key, link)))
 
-    async def _fetch(self, key: str, url: str, fetch: Fetch) -> bool:
+    async def _fetch(self, url: str, fetch: Fetch, key: str, *also: tuple[str, str]) -> bool:
+        """Fetch the metadata at ``url``, and cache under ``key`` and ``also`` whether it announces for ``key``."""
         try:
             status, body = await fetch(url)
         except Exception as exc:  # network errors are not cached
@@ -218,10 +277,13 @@ class ExtensionRegistry:
             return False
         announced = _announces(key, status, body)
         if 200 <= status < 300 or status == 404:
-            # A slower fetch of the well-known URL must not undo what a challenge's link has shown
-            self._announced[key] = announced or self._announced.get(key, False)
+            ttl = self._ttl
         else:
             logger.warning("protected resource metadata %s returned %d", url, status)
+            ttl = self._error_ttl
+        keys: tuple[str | tuple[str, str], ...] = (key, *also)
+        for k in keys:
+            self._set(k, announced, ttl)
         return announced
 
 

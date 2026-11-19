@@ -55,6 +55,25 @@ async def test_adds_token_and_extension_without_context() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("url", "allow_http", "sent"),
+    [
+        ("https://agent.example.com/", False, True),
+        ("http://127.0.0.1:8000/", False, True),
+        ("http://agent.example.com/", False, False),
+        ("http://agent.example.com/", True, True),
+    ],
+)
+async def test_plain_http_agent(url: str, allow_http: bool, sent: bool) -> None:
+    agent_card = card(A2A_EXTENSION_URI)
+    agent_card.supported_interfaces.add(url="https://agent.example.com/", protocol_binding="JSONRPC")
+    agent_card.supported_interfaces.add(url=url, protocol_binding="HTTP+JSON")
+    before = args(agent_card)
+    with use_token("tok"):
+        await DelegatedTokenInterceptor(allow_http=allow_http).before(before)
+    assert (before.context is not None) is sent
+
+
 async def test_merges_with_existing_extensions() -> None:
     context = ClientCallContext(service_parameters={A2A_EXTENSIONS_HEADER: OTHER_URI, "Other": "x"})
     before = args(card(A2A_EXTENSION_URI), context)

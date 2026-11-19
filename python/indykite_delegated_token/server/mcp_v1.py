@@ -23,7 +23,7 @@ HTTP request, so a contextvar set by ASGI middleware would not reach them. Every
 from __future__ import annotations
 
 import functools
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import ParamSpec, TypeVar
 
 from mcp.server.lowlevel.server import request_ctx
@@ -59,10 +59,22 @@ def _wrap(handler: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
 
 
 class _WrappingHandlers(dict[type, Handler]):
-    """Wraps every handler stored in it, including the ones registered after :func:`install`."""
+    """Wraps every handler stored in it, including the ones registered after :func:`install`.
+
+    ``update`` and ``setdefault`` are overridden too: ``dict``'s own do not call ``__setitem__``.
+    """
 
     def __setitem__(self, key: type, value: Handler) -> None:
         super().__setitem__(key, _wrap(value))
+
+    def update(self, handlers: Mapping[type, Handler], /) -> None:  # type: ignore[override]
+        for key, value in handlers.items():
+            self[key] = value
+
+    def setdefault(self, key: type, default: Handler) -> Handler:
+        if key not in self:
+            self[key] = default
+        return self[key]
 
 
 def install(server: object) -> None:
@@ -74,8 +86,7 @@ def install(server: object) -> None:
     if isinstance(handlers, _WrappingHandlers):
         return
     wrapping = _WrappingHandlers()
-    for key, handler in handlers.items():
-        wrapping[key] = handler
+    wrapping.update(handlers)
     setattr(lowlevel, "request_handlers", wrapping)  # noqa: B010
     # The experimental handlers keep a reference to the dict they register into, and mcp 1.x has no public way to
     # repoint it: without this, handlers registered through `server.experimental` would skip the wrapper

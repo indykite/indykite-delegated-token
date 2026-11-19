@@ -22,7 +22,7 @@ from typing import Any, Protocol, Self, TypeVar
 
 from indykite_delegated_token._constants import DELEGATED_TOKEN_HEADER
 from indykite_delegated_token._context import get_delegated_token
-from indykite_delegated_token.client._discovery import ExtensionRegistry, challenge_link, same_origin
+from indykite_delegated_token.client._discovery import ExtensionRegistry, challenge_link, same_origin, secure_transport
 
 __all__ = [
     "MAX_BODY",
@@ -75,12 +75,14 @@ class _Response(Protocol):
 
 class _Transport(Protocol):
     async def __aenter__(self) -> Any: ...  # noqa: ANN401 - the transport itself
+
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None = None,
         exc_value: BaseException | None = None,
         traceback: TracebackType | None = None,
     ) -> None: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -194,6 +196,20 @@ class WrappingTransport:
         await self._transport.aclose()
 
 
+def _token_for(request: _Request, target: str, first_url: str, registry: ExtensionRegistry) -> str | None:
+    """The token ``request`` may carry if its target announces, or ``None`` when it must go out unchanged."""
+    token = get_delegated_token()
+    if token is None or DELEGATED_TOKEN_HEADER in request.headers:
+        return None
+    if not same_origin(first_url, target):
+        # A redirect to another origin, or from https to http: the token only goes where the caller sent the request,
+        # never where a server sends it on, even if that announces the extension
+        return None
+    if not registry.allow_http and not secure_transport(target):
+        return None  # neither the token nor the metadata that announces it would be protected
+    return token
+
+
 async def handle(
     request: Req,
     *,
@@ -216,12 +232,8 @@ async def handle(
     """
     target = str(request.url)
     first_url = str(request.extensions.setdefault(_FIRST_URL, target))
-    token = get_delegated_token()
-    if token is None or DELEGATED_TOKEN_HEADER in request.headers:
-        return await send(request)
-    if not same_origin(first_url, target):
-        # A redirect to another origin, or from https to http: the token only goes where the caller sent the request,
-        # never where a server sends it on, even if that announces the extension
+    token = _token_for(request, target, first_url, registry)
+    if token is None:
         return await send(request)
 
     async def fetch(url: str) -> tuple[int, bytes]:

@@ -111,6 +111,27 @@ async def test_not_announced_target_gets_nothing(lib: tuple[ModuleType, ModuleTy
     assert response.json() == {"seen": None}
 
 
+@pytest.mark.parametrize(("allow_http", "expected"), [(False, None), (True, "tok")])
+async def test_plain_http_needs_allow_http(
+    lib: tuple[ModuleType, ModuleType], allow_http: bool, expected: str | None
+) -> None:
+    http, adapter = lib
+    url, urls = "http://mcp.example.com/mcp", []
+
+    def target(request: Any) -> Any:
+        urls.append(str(request.url))
+        if "/.well-known/" in str(request.url):
+            return http.Response(200, json={"resource": url, "mcp_extensions": {MCP_EXTENSION_ID: {}}})
+        return http.Response(200, json={"seen": request.headers.get("X-IK-Token")})
+
+    registry = ExtensionRegistry(allow_http=allow_http)
+    async with adapter.http_client(transport=http.MockTransport(target), registry=registry) as c:
+        with use_token("tok"):
+            response = await c.post(url, content=b"{}")
+    assert response.json() == {"seen": expected}
+    assert len(urls) == (2 if allow_http else 1)  # without allow_http, not even the metadata is fetched
+
+
 async def test_caller_header_is_kept(lib: tuple[ModuleType, ModuleType]) -> None:
     target = Target()
     async with client(lib, target) as c:
