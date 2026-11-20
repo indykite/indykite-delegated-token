@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
-from types import TracebackType
-from typing import Any, Protocol, Self, TypeVar
+from contextvars import ContextVar
+from types import ModuleType, TracebackType
+from typing import Any, Protocol, Self, TypeVar, cast
 
 from indykite_delegated_token._constants import DELEGATED_TOKEN_HEADER
 from indykite_delegated_token._context import get_delegated_token
@@ -26,13 +28,11 @@ from indykite_delegated_token.client._discovery import ExtensionRegistry, challe
 
 __all__ = [
     "MAX_BODY",
-    "METADATA_HEADERS",
     "READ_DEADLINE",
-    "Replay",
     "WrappingTransport",
     "handle",
-    "metadata_timeout",
-    "read_raw",
+    "in_chain",
+    "sending",
 ]
 
 # The most of a metadata answer or of a 401 that is read: both are small, and a target must not be able to make the
@@ -42,7 +42,7 @@ MAX_BODY = 64 * 1024
 # cannot hold up the call: a metadata fetch, and the read of a 401 before discovery
 READ_DEADLINE = 30.0
 # Headers of the metadata fetch: uncompressed only, so the size limit on the body holds for what is decoded too
-METADATA_HEADERS = {"Accept": "application/json", "Accept-Encoding": "identity"}
+_METADATA_HEADERS = {"Accept": "application/json", "Accept-Encoding": "identity"}
 # Seconds of the metadata fetch's timeouts that the request leaves unset, so a stalled endpoint cannot block the call
 # forever
 _METADATA_TIMEOUT = 10.0
@@ -51,15 +51,20 @@ _METADATA_TIMEOUT = 10.0
 class _Headers(Protocol):
     def get(self, key: str, /) -> str | None: ...
     def __contains__(self, key: object) -> bool: ...
+    def copy(self) -> MutableMapping[str, str]: ...
 
 
 class _Request(Protocol):
+    @property
+    def method(self) -> str: ...
     @property
     def url(self) -> object: ...
     @property
     def headers(self) -> _Headers: ...
     @property
     def content(self) -> bytes: ...
+    @property
+    def stream(self) -> object: ...
     @property
     def extensions(self) -> MutableMapping[str, object]: ...
 
@@ -69,6 +74,13 @@ class _Response(Protocol):
     def status_code(self) -> int: ...
     @property
     def headers(self) -> _Headers: ...
+    @property
+    def extensions(self) -> object: ...
+    @property
+    def is_stream_consumed(self) -> bool: ...
+    @property
+    def content(self) -> bytes: ...
+    def aiter_raw(self) -> AsyncIterator[bytes]: ...
     async def aread(self) -> bytes: ...
     async def aclose(self) -> None: ...
 
@@ -90,13 +102,32 @@ class _Transport(Protocol):
 # request into the redirect it builds from it
 _FIRST_URL = "indykite_delegated_token.first_url"
 
+# Set while the package sends a request, so the global hook does not handle it a second time
+_sending: ContextVar[bool] = ContextVar("indykite_delegated_token_sending", default=False)
+
 Req = TypeVar("Req", bound=_Request)
 Resp = TypeVar("Resp", bound=_Response)
 
-# Reads at most `limit` bytes of a response's body. Returns an equivalent response and whether it read all of it: then
-# the connection is free. If not, the response replays what was read and then streams the rest.
-# It closes the response and raises if the body does not arrive within `deadline` seconds, or on any other error.
-Buffer = Callable[[Resp, int, float], Awaitable[tuple[Resp, bool]]]
+
+def sending() -> bool:
+    """Whether the current request is sent by :func:`handle`."""
+    return _sending.get()
+
+
+def in_chain(request: _Request) -> bool:
+    """Whether ``request`` belongs to a redirect chain that :func:`handle` started."""
+    return _FIRST_URL in request.extensions
+
+
+def _flagged(send: Callable[[Req], Awaitable[Resp]]) -> Callable[[Req], Awaitable[Resp]]:
+    async def flagged(request: Req) -> Resp:
+        reset = _sending.set(True)
+        try:
+            return await send(request)
+        finally:
+            _sending.reset(reset)
+
+    return flagged
 
 
 def _replayable(request: _Request) -> bool:
@@ -120,37 +151,32 @@ def metadata_timeout(request: _Request) -> dict[str, Any]:
     return timeout
 
 
-async def read_raw(
-    response: _Response, raw: AsyncIterator[bytes], limit: int, deadline: float
-) -> tuple[list[bytes], bool]:
-    """Read the raw chunks of ``response`` until the body ends or more than ``limit`` bytes arrived.
-
-    Returns the chunks and whether they are the whole body. ``deadline`` is in all, not per read: a body that trickles
-    in must not hold up the call, and raises :class:`TimeoutError`. On that and any other error the response is closed,
-    because a body read in part cannot be returned.
-    """
-    import anyio
-
-    read: list[bytes] = []
-    size = 0
-    try:
-        with anyio.fail_after(deadline):
-            async for chunk in raw:
-                read.append(chunk)
-                size += len(chunk)
-                if size > limit:
-                    return read, False
-    except BaseException:
-        with anyio.CancelScope(shield=True):  # give the connection back
-            await response.aclose()
-        raise
-    return read, True
+# The functions below take the HTTP library, ``httpx`` or ``httpx2``, whose APIs are the same
 
 
-class Replay:
+def _plain_get(lib: ModuleType, url: str, request: Req) -> Req:
+    """A plain GET of ``url`` for the metadata fetch, without any of the client's headers but with its timeout."""
+    return cast(
+        Req, lib.Request("GET", url, headers=_METADATA_HEADERS, extensions={"timeout": metadata_timeout(request)})
+    )
+
+
+def _with_header(lib: ModuleType, request: Req, name: str, value: str | None) -> Req:
+    """A copy of ``request`` with the header ``name`` set to ``value``, or removed when ``value`` is ``None``."""
+    headers = request.headers.copy()
+    headers.pop(name, None)
+    if value is not None:
+        headers[name] = value
+    return cast(
+        Req,
+        lib.Request(request.method, request.url, headers=headers, stream=request.stream, extensions=request.extensions),
+    )
+
+
+class _Replay:
     """The raw body chunks already read from a response, then the rest of it, if any.
 
-    Each library's module combines it with its ``AsyncByteStream``.
+    :func:`_replay_class` combines it with each library's ``AsyncByteStream``.
     """
 
     def __init__(self, read: list[bytes], rest: AsyncIterator[bytes] | None, response: _Response) -> None:
@@ -170,6 +196,47 @@ class Replay:
 
     async def aclose(self) -> None:
         await self._response.aclose()
+
+
+@functools.cache
+def _replay_class(lib: ModuleType) -> type[_Replay]:
+    return type("_Replay", (_Replay, lib.AsyncByteStream), {})
+
+
+async def _buffer(lib: ModuleType, response: Resp, limit: int, deadline: float) -> tuple[Resp, bool]:
+    """Read at most ``limit`` bytes of the body of ``response``.
+
+    Returns an equivalent response and whether it read all of it: then the connection is free. If not, the response
+    replays what was read and then streams the rest. ``deadline`` is in all, not per read: a body that trickles in must
+    not hold up the call. On that and any other error the response is closed, because a body read in part cannot be
+    returned.
+    """
+    import anyio
+
+    if response.is_stream_consumed:  # a body given in memory, as by a mock transport, is read already
+        return response, len(response.content) <= limit
+    # Raw bytes, before any decompression, so the limit holds; the client decodes the replayed body as usual
+    raw = response.aiter_raw()
+    read: list[bytes] = []
+    size = 0
+    complete = True
+    try:
+        with anyio.fail_after(deadline):
+            async for chunk in raw:
+                read.append(chunk)
+                size += len(chunk)
+                if size > limit:
+                    complete = False
+                    break
+    except BaseException as exc:
+        with anyio.CancelScope(shield=True):  # give the connection back
+            await response.aclose()
+        if isinstance(exc, TimeoutError):
+            raise lib.ReadTimeout(f"response body not read within {deadline} seconds") from exc
+        raise
+    stream = _replay_class(lib)(read, None if complete else raw, response)
+    copy = lib.Response(response.status_code, headers=response.headers, stream=stream, extensions=response.extensions)
+    return cast(Resp, copy), complete
 
 
 class WrappingTransport:
@@ -196,56 +263,57 @@ class WrappingTransport:
         await self._transport.aclose()
 
 
-def _token_for(request: _Request, target: str, first_url: str, registry: ExtensionRegistry) -> str | None:
-    """The token ``request`` may carry if its target announces, or ``None`` when it must go out unchanged."""
-    token = get_delegated_token()
-    if token is None or DELEGATED_TOKEN_HEADER in request.headers:
-        return None
+def _may_carry(target: str, first_url: str, registry: ExtensionRegistry) -> bool:
+    """Whether ``target`` may get the token if it announces the extension."""
     if not same_origin(first_url, target):
         # A redirect to another origin, or from https to http: the token only goes where the caller sent the request,
         # never where a server sends it on, even if that announces the extension
-        return None
-    if not registry.allow_http and not secure_transport(target):
-        return None  # neither the token nor the metadata that announces it would be protected
-    return token
+        return False
+    # Over plain HTTP, neither the token nor the metadata that announces it would be protected
+    return registry.allow_http or secure_transport(target)
 
 
 async def handle(
     request: Req,
     *,
     send: Callable[[Req], Awaitable[Resp]],
-    make_get: Callable[[str, Req], Req],
-    with_header: Callable[[Req, str, str], Req],
-    buffer: Buffer[Resp],
+    lib: ModuleType,
     registry: ExtensionRegistry,
 ) -> Resp:
-    """Send ``request``, with the delegated token if the target announced the extension.
+    """Send ``request``, with the delegated token only if the target announced the extension.
 
-    ``send`` sends a request through the wrapped transport. ``make_get(url, request)`` builds a plain GET request for
-    the metadata fetch, without any of the client's headers but with the timeout of ``request``.
-    ``with_header(request, name, value)`` returns a copy of ``request`` with one more header. ``buffer`` reads a
-    response's body up to a limit, see :data:`Buffer`.
+    The token is the one the caller set in ``X-IK-Token``, or else the one of the context. A target that does not
+    announce, another origin after a redirect, or plain HTTP without ``allow_http``, gets no token, also when the
+    caller set it.
+
+    ``send`` sends a request through the wrapped transport of ``lib``, the HTTP library: ``httpx`` or ``httpx2``.
 
     ``request`` itself is never changed, but for one extension that records where a redirect chain started: the
     client builds redirects and retries from it, and they must not carry the token to a target that did not announce
     the extension, or to another origin. Each of them comes back through this function.
     """
+    send = _flagged(send)
     target = str(request.url)
     first_url = str(request.extensions.setdefault(_FIRST_URL, target))
-    token = _token_for(request, target, first_url, registry)
+    token = request.headers.get(DELEGATED_TOKEN_HEADER) or get_delegated_token()
     if token is None:
         return await send(request)
+    bare = request
+    if DELEGATED_TOKEN_HEADER in request.headers:
+        bare = _with_header(lib, request, DELEGATED_TOKEN_HEADER, None)
+    if not _may_carry(target, first_url, registry):
+        return await send(bare)
 
     async def fetch(url: str) -> tuple[int, bytes]:
         import anyio
 
         with anyio.fail_after(READ_DEADLINE):
-            response = await send(make_get(url, request))
+            response = await send(_plain_get(lib, url, request))
             try:
                 encoding = response.headers.get("content-encoding")
                 if encoding and encoding.lower() != "identity":  # asked for identity: a compressed body is unbounded
                     raise ValueError(f"unexpected content encoding {encoding}")
-                response, complete = await buffer(response, MAX_BODY, READ_DEADLINE)
+                response, complete = await _buffer(lib, response, MAX_BODY, READ_DEADLINE)
                 if not complete:
                     raise ValueError(f"larger than {MAX_BODY} bytes")
                 return response.status_code, await response.aread()
@@ -254,9 +322,9 @@ async def handle(
                     await response.aclose()
 
     if await registry.discover(target, fetch):
-        return await send(with_header(request, DELEGATED_TOKEN_HEADER, token))
+        return await send(_with_header(lib, request, DELEGATED_TOKEN_HEADER, token))
 
-    response = await send(request)
+    response = await send(bare)
     if response.status_code != 401 or not _replayable(request):
         return response
     challenge = response.headers.get("www-authenticate")
@@ -265,8 +333,8 @@ async def handle(
     # Read the 401 before discovery to free its connection: the metadata fetch may need it from a small pool, also
     # while this call waits for another call's fetch. A body too large to hold goes back to the caller without
     # discovery.
-    response, complete = await buffer(response, MAX_BODY, READ_DEADLINE)
+    response, complete = await _buffer(lib, response, MAX_BODY, READ_DEADLINE)
     if not complete or not await registry.learn_from_challenge(target, challenge, fetch):
         return response
     await response.aclose()
-    return await send(with_header(request, DELEGATED_TOKEN_HEADER, token))
+    return await send(_with_header(lib, request, DELEGATED_TOKEN_HEADER, token))

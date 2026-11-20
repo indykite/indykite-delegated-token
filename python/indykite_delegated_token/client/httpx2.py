@@ -24,14 +24,7 @@ from __future__ import annotations
 import httpx2
 
 from indykite_delegated_token.client._discovery import DEFAULT_REGISTRY, ExtensionRegistry
-from indykite_delegated_token.client._transport_core import (
-    METADATA_HEADERS,
-    Replay,
-    WrappingTransport,
-    handle,
-    metadata_timeout,
-    read_raw,
-)
+from indykite_delegated_token.client._transport_core import WrappingTransport, handle
 
 __all__ = ["DelegatedTokenTransport", "http_client", "httpx_client_factory"]
 
@@ -39,43 +32,12 @@ __all__ = ["DelegatedTokenTransport", "http_client", "httpx_client_factory"]
 _DEFAULT_TIMEOUT = httpx2.Timeout(30.0, read=300.0)
 
 
-def _plain_get(url: str, request: httpx2.Request) -> httpx2.Request:
-    return httpx2.Request("GET", url, headers=METADATA_HEADERS, extensions={"timeout": metadata_timeout(request)})
-
-
-class _Replay(Replay, httpx2.AsyncByteStream):
-    """:class:`Replay` as an ``httpx2`` stream."""
-
-
-async def _buffer(response: httpx2.Response, limit: int, deadline: float) -> tuple[httpx2.Response, bool]:
-    if response.is_stream_consumed:  # a body given in memory, as by a mock transport, is read already
-        return response, len(response.content) <= limit
-    # Raw bytes, before any decompression, so the limit holds; the client decodes the replayed body as usual
-    raw = response.aiter_raw()
-    try:
-        read, complete = await read_raw(response, raw, limit, deadline)
-    except TimeoutError as exc:
-        raise httpx2.ReadTimeout(f"response body not read within {deadline} seconds") from exc
-    stream = _Replay(read, None if complete else raw, response)
-    copy = httpx2.Response(
-        response.status_code, headers=response.headers, stream=stream, extensions=response.extensions
-    )
-    return copy, complete
-
-
-def _with_header(request: httpx2.Request, name: str, value: str) -> httpx2.Request:
-    headers = request.headers.copy()
-    headers[name] = value
-    return httpx2.Request(
-        request.method, request.url, headers=headers, stream=request.stream, extensions=request.extensions
-    )
-
-
 class DelegatedTokenTransport(WrappingTransport, httpx2.AsyncBaseTransport):
     """Adds ``X-IK-Token`` to the requests for targets that announce the delegated token extension.
 
-    The token is the one of the request being handled (:func:`get_delegated_token`). Requests without a token, and
-    requests to targets that do not announce, go out unchanged. A header the caller set is never replaced.
+    The token is the one the caller set in ``X-IK-Token``, or else the one of the request being handled
+    (:func:`get_delegated_token`). Requests to targets that do not announce go out without ``X-IK-Token``, also when
+    the caller set it.
     """
 
     _transport: httpx2.AsyncBaseTransport
@@ -90,14 +52,7 @@ class DelegatedTokenTransport(WrappingTransport, httpx2.AsyncBaseTransport):
         self._registry = registry if registry is not None else DEFAULT_REGISTRY
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
-        return await handle(
-            request,
-            send=self._transport.handle_async_request,
-            make_get=_plain_get,
-            with_header=_with_header,
-            buffer=_buffer,
-            registry=self._registry,
-        )
+        return await handle(request, send=self._transport.handle_async_request, lib=httpx2, registry=self._registry)
 
 
 def http_client(

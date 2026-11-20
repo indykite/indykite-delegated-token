@@ -88,13 +88,17 @@ async def test_merges_with_existing_extensions() -> None:
     assert parameters["Other"] == "x"
 
 
-async def test_keeps_caller_token() -> None:
+@pytest.mark.parametrize("context_token", ["tok", None], ids=["with-context", "without-context"])
+async def test_keeps_caller_token(context_token: str | None) -> None:
     context = ClientCallContext(service_parameters={DELEGATED_TOKEN_HEADER: "caller"})
     before = args(card(A2A_EXTENSION_URI), context)
-    with use_token("tok"):
+    with use_token(context_token):
         await DelegatedTokenInterceptor().before(before)
     assert before.context is not None
-    assert (before.context.service_parameters or {})[DELEGATED_TOKEN_HEADER] == "caller"
+    assert before.context.service_parameters == {
+        DELEGATED_TOKEN_HEADER: "caller",
+        A2A_EXTENSIONS_HEADER: A2A_EXTENSION_URI,
+    }
 
 
 async def test_keeps_caller_token_in_any_case() -> None:
@@ -105,6 +109,27 @@ async def test_keeps_caller_token_in_any_case() -> None:
     assert before.context is not None
     parameters = before.context.service_parameters or {}
     assert [value for name, value in parameters.items() if name.lower() == "x-ik-token"] == ["caller"]
+
+
+async def test_replaces_empty_caller_token() -> None:
+    context = ClientCallContext(service_parameters={"x-ik-token": ""})
+    before = args(card(A2A_EXTENSION_URI), context)
+    with use_token("tok"):
+        await DelegatedTokenInterceptor().before(before)
+    assert before.context is not None
+    parameters = before.context.service_parameters or {}
+    assert [value for name, value in parameters.items() if name.lower() == "x-ik-token"] == ["tok"]
+
+
+@pytest.mark.parametrize("context_token", ["tok", None], ids=["with-context", "without-context"])
+async def test_removes_caller_token_for_agent_without_extension(context_token: str | None) -> None:
+    context = ClientCallContext(service_parameters={"x-IK-token": "caller", "Other": "x"})
+    before = args(card(OTHER_URI), context)
+    with use_token(context_token):
+        await DelegatedTokenInterceptor().before(before)
+    assert before.context is not None
+    assert before.context.service_parameters == {"Other": "x"}
+    assert context.service_parameters == {"x-IK-token": "caller", "Other": "x"}  # the caller's is unchanged
 
 
 async def test_reused_context_gets_the_token_of_each_call() -> None:

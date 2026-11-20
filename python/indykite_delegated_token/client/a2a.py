@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from a2a.client.client import ClientCallContext
 from a2a.client.interceptors import AfterArgs, BeforeArgs, ClientCallInterceptor
-from a2a.client.service_parameters import ServiceParametersFactory, with_a2a_extensions
+from a2a.client.service_parameters import ServiceParametersFactory, ServiceParametersUpdate, with_a2a_extensions
 
 from indykite_delegated_token._constants import A2A_EXTENSION_URI, DELEGATED_TOKEN_HEADER
 from indykite_delegated_token._context import get_delegated_token
@@ -34,12 +34,30 @@ def announces_extension(agent_card: object) -> bool:
     return any(getattr(extension, "uri", None) == A2A_EXTENSION_URI for extension in extensions)
 
 
+_WANTED = DELEGATED_TOKEN_HEADER.lower()  # service parameters become HTTP headers, whose names ignore case
+
+
+def _caller_token(parameters: dict[str, str]) -> str | None:
+    return next((value for name, value in parameters.items() if name.lower() == _WANTED and value), None)
+
+
+def _drop_token(parameters: dict[str, str]) -> None:
+    for name in [name for name in parameters if name.lower() == _WANTED]:
+        del parameters[name]
+
+
+def _updated(context: ClientCallContext, updates: list[ServiceParametersUpdate]) -> ClientCallContext:
+    # A copy, never the caller's context: a context reused for a later call would keep this call's token
+    parameters = ServiceParametersFactory.create_from(context.service_parameters, updates)
+    return context.model_copy(update={"service_parameters": parameters})
+
+
 class DelegatedTokenInterceptor(ClientCallInterceptor):
     """Adds ``X-IK-Token`` and the extension URI in ``A2A-Extensions`` to calls to agents that announce it.
 
-    Works with every A2A transport, because it sets service parameters rather than HTTP headers. Calls without a
-    delegated token, and calls to agents whose card does not list the extension, are left unchanged. A token the
-    caller already set is kept.
+    Works with every A2A transport, because it sets service parameters rather than HTTP headers. The token is the one
+    the caller set in ``X-IK-Token``, or else the one of the request being handled. Calls to agents whose card does
+    not list the extension, or that fail the check below, go out without ``X-IK-Token``, also when the caller set it.
 
     The card is trusted as given: a2a-sdk tells the interceptor neither where it came from nor which of its interfaces
     the call uses. The token only goes to agents whose interfaces all pass :func:`secure_transport`, unless
@@ -51,20 +69,25 @@ class DelegatedTokenInterceptor(ClientCallInterceptor):
     def __init__(self, *, allow_http: bool = False) -> None:
         self._allow_http = allow_http
 
-    async def before(self, args: BeforeArgs) -> None:
-        token = get_delegated_token()
-        interfaces = getattr(args.agent_card, "supported_interfaces", None) or ()
+    def _trusted(self, agent_card: object) -> bool:
+        interfaces = getattr(agent_card, "supported_interfaces", None) or ()
         secure = self._allow_http or all(secure_transport(getattr(i, "url", "")) for i in interfaces)
-        if token is None or not secure or not announces_extension(args.agent_card):
-            return
+        return secure and announces_extension(agent_card)
+
+    async def before(self, args: BeforeArgs) -> None:
         context = args.context if args.context is not None else ClientCallContext()
+        caller = _caller_token(context.service_parameters or {})
+        token = caller or get_delegated_token()
+        if token is None:
+            return
+        if not self._trusted(args.agent_card):
+            if caller is not None:
+                args.context = _updated(context, [_drop_token])
+            return
         updates = [with_a2a_extensions([A2A_EXTENSION_URI])]
-        wanted = DELEGATED_TOKEN_HEADER.lower()  # service parameters become HTTP headers, whose names ignore case
-        if not any(name.lower() == wanted for name in context.service_parameters or {}):
-            updates.append(lambda parameters: parameters.__setitem__(DELEGATED_TOKEN_HEADER, token))
-        parameters = ServiceParametersFactory.create_from(context.service_parameters, updates)
-        # A copy, never the caller's context: a context reused for a later call would keep this call's token
-        args.context = context.model_copy(update={"service_parameters": parameters})
+        if caller is None:
+            updates += [_drop_token, lambda parameters: parameters.__setitem__(DELEGATED_TOKEN_HEADER, token)]
+        args.context = _updated(context, updates)
 
     async def after(self, args: AfterArgs) -> None:  # skipcq: PYL-R0201 - overrides ClientCallInterceptor.after
         return None
