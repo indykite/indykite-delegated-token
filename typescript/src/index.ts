@@ -15,8 +15,13 @@
 /**
  * IndyKite delegated token propagation for AI agents and MCP servers.
  *
+ * On the server side, the middlewares of `./express`, `./hono` and `./mcp-handler` make the delegated token of each
+ * request available through {@link getDelegatedToken}. On the client side, `./fetch` and `./a2a` send it on to the
+ * MCP servers and A2A agents that announce the extension.
+ *
  * @packageDocumentation
  */
 
-/** HTTP header that carries the delegated token between the hops of a workflow. */
-export const DELEGATED_TOKEN_HEADER = "X-IK-Token";
+export { A2A_EXTENSION_URI, A2A_EXTENSIONS_HEADER, DELEGATED_TOKEN_HEADER, MCP_EXTENSION_ID } from "./constants.js";
+export { getDelegatedToken, type HeadersLike, runWithToken, tokenFromHeaders } from "./context.js";
+export { tokenFromContext, type ToolContext } from "./server/context.js";
