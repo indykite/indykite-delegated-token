@@ -1,0 +1,9 @@
+# Prettier formats the TypeScript package only. This file is for runs from the repository root, such as DeepSource's
+# Prettier transformer: without it, it reformats the YAML that yamlfmt owns (see .pre-commit-config.yaml).
+# The package's own runs, from typescript/, use typescript/.prettierignore.
+/*
+!/typescript/
+/typescript/coverage/
+/typescript/dist/
+/typescript/pnpm-lock.yaml
+/typescript/CHANGELOG.md
