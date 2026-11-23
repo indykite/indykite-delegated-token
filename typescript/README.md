@@ -6,9 +6,9 @@ Gateway.
 > [!WARNING]
 > Work in progress, not published to npm yet.
 
-The agent gateway in front of an MCP server sends the workflow's delegated token in the `X-IK-Token` header. When a
-tool calls another MCP server or A2A agent through the next gateway, the call must carry the token too. This package
-does both halves:
+The agent gateway in front of an MCP server or an A2A agent sends the workflow's delegated token in the `X-IK-Token`
+header. When that server or agent calls another MCP server or A2A agent through the next gateway, the call must carry
+the token too. This package does both halves:
 
 - **server side**: middleware that makes the token of the current request available through `getDelegatedToken()`;
 - **client side**: a `fetch` wrapper (MCP) and an interceptor (A2A) that send it on, only to targets that announce the
@@ -25,7 +25,7 @@ Node.js 22+, no dependencies.
 | Entry point                             | Contents                                     | Works with                       |
 | --------------------------------------- | -------------------------------------------- | -------------------------------- |
 | `@indykite/delegated-token`             | `getDelegatedToken()`, `runWithToken()`, ... | -                                |
-| `@indykite/delegated-token/express`     | `delegatedToken()` middleware                | Express 4 and 5                  |
+| `@indykite/delegated-token/express`     | `delegatedToken()` middleware                | Express 4 and 5, `@a2a-js/sdk`   |
 | `@indykite/delegated-token/hono`        | `delegatedToken()` middleware                | Hono 4                           |
 | `@indykite/delegated-token/mcp-handler` | `withDelegatedToken(handler)`                | Vercel `mcp-handler` 1.x and 2.x |
 | `@indykite/delegated-token/fetch`       | `delegatedTokenFetch()`, `redirectGuard()`   | MCP TypeScript SDK 1.x and 2.x   |
@@ -79,7 +79,6 @@ export { handler as GET, handler as POST, handler as DELETE };
 Each MCP message sees the token of the HTTP request that carried it, also in stateful sessions and under concurrency.
 A request with more than one `X-IK-Token` value, as several headers or one joined with commas, gets no token: a proxy
 may have appended the real one to one the caller forged.
-The Express and Hono middlewares work for A2A agents too.
 
 If a framework runs tools outside the async context of their HTTP request, read the token from the tool's second
 argument (`extra` in SDK 1.x, `ctx` in SDK 2.x). This is the case for the legacy SSE transport of `mcp-handler` 1.x,
@@ -92,6 +91,46 @@ server.registerTool("my_tool", { description: "..." }, (ctx) =>
   runWithToken(tokenFromContext(ctx), () => callTargets()),
 );
 ```
+
+### A2A agent: receive the token
+
+An A2A agent built with `@a2a-js/sdk` is an Express app. Mount `delegatedToken()` first, before the SDK handlers, with
+`stripHeader: true`:
+
+```ts
+import { agentCardHandler, jsonRpcHandler, restHandler, UserBuilder } from "@a2a-js/sdk/server/express";
+import express from "express";
+import { delegatedToken } from "@indykite/delegated-token/express";
+
+const app = express();
+app.use(delegatedToken({ stripHeader: true }));
+app.use("/.well-known/agent-card.json", agentCardHandler({ agentCardProvider: () => Promise.resolve(card) }));
+app.use("/rest", restHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }));
+app.use("/", jsonRpcHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }));
+```
+
+The executor reads the token with `getDelegatedToken()`, and the clients below send it on. Each `execute` call sees
+the token of the request that sent its message, also for a follow-up message to an existing task, for streaming
+requests and with `returnImmediately`. `cancelTask` sees the token of the cancel request. The agent card does not need
+to list the extension: the gateway declares it.
+
+`stripHeader: true` removes `X-IK-Token` from `req.headers`, `req.headersDistinct` and `req.rawHeaders`, so the token
+is reachable only through `getDelegatedToken()`. `@a2a-js/sdk` copies all request headers into the `ServerCallContext`
+of its executors; with the flag, the token is not there, so an executor or a tracer that dumps the context cannot leak
+it. The flag is off by default. Do not set it in front of an MCP server whose tools call `tokenFromContext()`: they
+read the header from the request, so they would see no token.
+
+The middleware works for JSON-RPC, REST and the v0.3 compat layer. The gateway exposes JSON-RPC only; gRPC is not
+supported.
+
+Work that leaves the process, such as a queue, must carry the token itself: read it with `getDelegatedToken()` and
+restore it in the worker with `runWithToken(token, fn)`. Tasks the executor starts in the same process keep the token
+of their request, also after the response is sent. The token may expire before such work ends; the next gateway then
+refuses the call.
+
+> [!WARNING]
+> Push notifications with the delegated token are not supported. The SDK's push notification sender uses the global
+> `fetch` and sends no token.
 
 ### Client: send the token on
 
@@ -172,7 +211,18 @@ Set `NODE_DEBUG=indykite-delegated-token` to log the metadata fetches that fail 
 > receives the token. Call only targets that your server's operator configured, such as `TARGET_MCP_URL` in the
 > examples, never a URL that comes from the tool's caller or from a model.
 
-## Example
+### Security
+
+- **Reach the server or agent only through its gateway.** It trusts any `X-IK-Token` it receives. The gateway
+  overwrites the header, but a caller that reaches the server directly can send any token.
+- **Reach other agents and MCP servers only through gateways**, with TLS on every hop. Use network policy to stop
+  calls to anything else.
+- **Mount the middleware first.** Middleware mounted before it still sees the header.
+- **Keep the token out of logs and traces.** `@a2a-js/sdk` keeps the request headers in `ServerCallContext.state`:
+  use `stripHeader: true`. It keeps `Authorization` the same way. If you enable OpenTelemetry header capture
+  (`OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_*`), leave `X-IK-Token` out of it.
+
+## Examples
 
 [`examples/sample-mcp-server`](examples/sample-mcp-server) is a runnable MCP server (SDK 2.x, Express) whose tools
 `call_mcp_tool` and `ask_agent` call an MCP server and an A2A agent through their gateways, like the Python sample.
@@ -187,6 +237,30 @@ docker run -p 8000:8000 \
 ```
 
 The server listens on `HOST`:`PORT` (default `0.0.0.0:8000`) and answers `GET /healthz`.
+
+[`examples/sample-a2a-agent`](examples/sample-a2a-agent) is a runnable A2A agent (`@a2a-js/sdk`, MCP SDK 2.x) that
+does the same without a model. A message with a data part `{"mcp_tool": "<name>", "arguments": {...}}` calls that tool
+on `TARGET_MCP_URL`; any other message is sent as text to the agent at `TARGET_AGENT_URL`. The reply is a completed
+task with one text artifact. `PUBLIC_URL` is the agent's URL in its card (default `http://localhost:<PORT>`).
+`ALLOW_HTTP=1` sends the token over plain HTTP too, such as to a gateway in a private network.
+
+```sh
+docker build -f examples/sample-a2a-agent/Dockerfile -t indykite-delegated-token-sample-agent .
+docker run -p 8000:8000 \
+  -e PUBLIC_URL=https://sample-agent.internal.example.com \
+  -e TARGET_MCP_URL=https://gateway.example.com/mcp \
+  -e TARGET_AGENT_URL=https://agent-gateway.example.com \
+  indykite-delegated-token-sample-agent
+```
+
+To check the chain against real gateways:
+
+1. Deploy the sample agent behind a gateway with a token service, and point `TARGET_MCP_URL` and `TARGET_AGENT_URL`
+   at targets behind gateways with a token service.
+2. Send a message to the sample agent's gateway with a user token, for example `hi` for the A2A target, or a data part
+   `{"mcp_tool": "whoami"}` for an MCP target with such a tool.
+3. In the target's logs, or with the gateway's `whoami`, check that the target received `X-IK-Token` with the user,
+   the sample agent's gateway and the target's gateway in the chain.
 
 ## Development
 

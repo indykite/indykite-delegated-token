@@ -52,6 +52,7 @@ import {
   sendingToken,
   serve,
   type Served,
+  serveForTest,
   text,
 } from "./harness.js";
 
@@ -153,16 +154,23 @@ function relay(version: SdkVersion): Relay {
   };
 }
 
-function serverV1(body: Relay): McpServerV1 {
-  const server = new McpServerV1({ name: "sample", version: "1.0.0" });
+/** An MCP server of either SDK. */
+interface ToolServer {
+  registerTool: (name: string, config: { description: string }, cb: () => Promise<ReturnType<typeof text>>) => unknown;
+}
+
+/** `server`, with a `relay` tool that runs `body`. */
+function withRelay<S extends ToolServer>(server: S, body: Relay): S {
   server.registerTool("relay", { description: "Call the targets" }, async () => text(await body()));
   return server;
 }
 
+function serverV1(body: Relay): McpServerV1 {
+  return withRelay(new McpServerV1({ name: "sample", version: "1.0.0" }), body);
+}
+
 function serverV2(body: Relay): McpServerV2 {
-  const server = new McpServerV2({ name: "sample", version: "1.0.0" });
-  server.registerTool("relay", { description: "Call the targets" }, async () => text(await body()));
-  return server;
+  return withRelay(new McpServerV2({ name: "sample", version: "1.0.0" }), body);
 }
 
 function sessionId(stateful: boolean) {
@@ -274,43 +282,22 @@ describe.each(SAMPLES)("%s", (_name, version, sample) => {
     ["stateful", true],
   ])("keeps the token of each request: %s", async (_mode, stateful) => {
     const built = sample(relay(version), stateful);
-    const served = await serve(() => built.handler);
-    try {
-      await concurrentUsers(version, `${served.url}/mcp`);
-    } finally {
-      await served.close();
-    }
+    await concurrentUsers(version, `${await serveForTest(() => built.handler)}/mcp`);
     expect(built.sessions()).toBe(stateful ? 2 : 0);
   });
 });
 
 function mcpHandler(version: SdkVersion, body: Relay): (req: Request) => Promise<Response> {
   if (version === "v1") {
-    return createMcpHandlerV1(
-      (server) => {
-        server.registerTool("relay", { description: "Call the targets" }, async () => text(await body()));
-      },
-      {},
-      { basePath: "", disableSse: true },
-    );
+    return createMcpHandlerV1((server) => withRelay(server, body), {}, { basePath: "", disableSse: true });
   }
-  return createMcpHandlerV2(
-    (server) => {
-      server.registerTool("relay", { description: "Call the targets" }, async () => text(await body()));
-    },
-    { telemetry: false },
-  );
+  return createMcpHandlerV2((server) => withRelay(server, body), { telemetry: false });
 }
 
 describe.each(VERSIONS)("mcp-handler with SDK %s", (version) => {
   it("keeps the token of each request", async () => {
     const handler = withDelegatedToken(mcpHandler(version, relay(version)));
-    const served = await serve(() => ({ fetch: handler }));
-    try {
-      await concurrentUsers(version, `${served.url}/mcp`);
-    } finally {
-      await served.close();
-    }
+    await concurrentUsers(version, `${await serveForTest(() => ({ fetch: handler }))}/mcp`);
   });
 });
 
@@ -323,15 +310,11 @@ describe("targets", () => {
   });
 
   it("an agent that redirects to another origin does not pass the token on", async () => {
-    const redirecting = await serve(redirectingAgent(targets.agent));
-    try {
-      const leaked = await runWithToken("tok", () => askAgent(redirecting.url, interceptorOnly()));
-      expect(leaked).toEqual({ token: "tok", extensions: A2A_EXTENSION_URI });
-      const guarded = await runWithToken("tok", () => askAgent(redirecting.url));
-      expect(guarded).toEqual({ token: null, extensions: A2A_EXTENSION_URI });
-    } finally {
-      await redirecting.close();
-    }
+    const redirecting = await serveForTest(redirectingAgent(targets.agent));
+    const leaked = await runWithToken("tok", () => askAgent(redirecting, interceptorOnly()));
+    expect(leaked).toEqual({ token: "tok", extensions: A2A_EXTENSION_URI });
+    const guarded = await runWithToken("tok", () => askAgent(redirecting));
+    expect(guarded).toEqual({ token: null, extensions: A2A_EXTENSION_URI });
   });
 
   it("an agent that does not announce gets nothing", async () => {

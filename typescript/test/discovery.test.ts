@@ -54,11 +54,8 @@ function answers(...responses: (MetadataResponse | Error)[]) {
 
 // A metadata fetch that answers when the test resolves it
 function pending() {
-  let resolve!: (response: MetadataResponse) => void;
-  const answer = new Promise<MetadataResponse>((done) => {
-    resolve = done;
-  });
-  return { fetch: vi.fn<MetadataFetch>(() => answer), resolve };
+  const { promise, resolve } = Promise.withResolvers<MetadataResponse>();
+  return { fetch: vi.fn<MetadataFetch>(() => promise), resolve };
 }
 
 function urls(fetch: ReturnType<typeof answers>): string[] {
@@ -369,15 +366,11 @@ describe("ExtensionRegistry.learnFromChallenge", () => {
 
   it("is not downgraded by a slower well-known fetch", async () => {
     const registry = new ExtensionRegistry();
-    let resolve!: (response: MetadataResponse) => void;
-    const slow = new Promise<MetadataResponse>((done) => {
-      resolve = done;
-    });
-    const wellKnown = vi.fn<MetadataFetch>(() => slow);
-    const discovery = registry.discover(TARGET, wellKnown);
+    const slow = pending();
+    const discovery = registry.discover(TARGET, slow.fetch);
 
     expect(await registry.learnFromChallenge(TARGET, CHALLENGE, answers(prm()))).toBe(true);
-    resolve({ status: 404, body: "" });
+    slow.resolve({ status: 404, body: "" });
     expect(await discovery).toBe(false);
     expect(registry.known(TARGET)).toBe(true);
   });

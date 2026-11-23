@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { request } from "node:http";
+
 import express from "express";
 import { Hono } from "hono";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { getDelegatedToken, runWithToken } from "../src/index.js";
 import { delegatedToken as expressDelegatedToken } from "../src/server/express.js";
 import { delegatedToken as honoDelegatedToken } from "../src/server/hono.js";
 import { withDelegatedToken } from "../src/server/mcp-handler.js";
 
-import { serve } from "./harness.js";
+import { serveForTest } from "./harness.js";
 
 describe("express", () => {
   it.each([
@@ -34,15 +36,122 @@ describe("express", () => {
     app.post("/", (_req, res) => {
       res.json({ token: getDelegatedToken() ?? null });
     });
-    const server = await serve(() => app);
-    onTestFinished(() => server.close());
+    const url = await serveForTest(() => app);
 
     // A body large enough to arrive in several chunks
     const body = JSON.stringify({ data: "x".repeat(200_000) });
     const post = (headers: Record<string, string>) =>
-      fetch(server.url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body });
+      fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body });
     expect(await (await post({ "X-IK-Token": "tok" })).json()).toEqual({ token: "tok" });
     expect(await (await post({})).json()).toEqual({ token: null });
+  });
+});
+
+interface Seen {
+  token: string | null;
+  headers: Record<string, unknown>;
+  headersDistinct: Record<string, unknown>;
+  rawHeaders: string[];
+}
+
+/** Send a GET with raw headers, as name-value pairs, and return what the handler saw. */
+function getRaw(url: string, rawHeaders: string[]): Promise<Seen> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { headers: rawHeaders }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Seen);
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+describe("express stripHeader", () => {
+  const sent = [
+    "Host",
+    "localhost",
+    "Connection",
+    "close",
+    "X-Dup",
+    "a",
+    "x-ik-token",
+    "tok",
+    "Authorization",
+    "Bearer b",
+    "X-Dup",
+    "b",
+  ];
+
+  /** With `readFirst`, a middleware before `delegatedToken()` reads `req.headersDistinct`. */
+  function serveWith(stripHeader?: boolean, readFirst = false): Promise<string> {
+    const app = express();
+    if (readFirst) {
+      app.use((req, _res, next) => {
+        expect(req.headersDistinct["x-ik-token"]).toEqual(["tok"]);
+        next();
+      });
+    }
+    app.use(expressDelegatedToken(stripHeader === undefined ? undefined : { stripHeader }));
+    app.get("/", (req, res) => {
+      const { headers, headersDistinct, rawHeaders } = req;
+      res.json({ token: getDelegatedToken() ?? null, headers, headersDistinct, rawHeaders });
+    });
+    return serveForTest(() => app);
+  }
+
+  it.each([false, true])(
+    "removes the header and keeps the token and the other headers in order, read first %s",
+    async (readFirst) => {
+      const seen = await getRaw(await serveWith(true, readFirst), sent);
+
+      expect(seen.token).toBe("tok");
+      expect(seen.headers).not.toHaveProperty("x-ik-token");
+      expect(seen.headers).toMatchObject({ "x-dup": "a, b", authorization: "Bearer b" });
+      expect(seen.headersDistinct).not.toHaveProperty("x-ik-token");
+      expect(seen.headersDistinct).toMatchObject({ "x-dup": ["a", "b"], authorization: ["Bearer b"] });
+      expect(seen.rawHeaders).toEqual([
+        "Host",
+        "localhost",
+        "Connection",
+        "close",
+        "X-Dup",
+        "a",
+        "Authorization",
+        "Bearer b",
+        "X-Dup",
+        "b",
+      ]);
+    },
+  );
+
+  it("removes every copy of the header", async () => {
+    const seen = await getRaw(await serveWith(true), [
+      "Host",
+      "localhost",
+      "Connection",
+      "close",
+      "X-IK-Token",
+      "a",
+      "x-ik-token",
+      "b",
+    ]);
+
+    expect(seen.token).toBeNull();
+    expect(seen.headers).not.toHaveProperty("x-ik-token");
+    expect(seen.headersDistinct).not.toHaveProperty("x-ik-token");
+    expect(seen.rawHeaders.map((value) => value.toLowerCase())).not.toContain("x-ik-token");
+  });
+
+  it.each([undefined, false])("keeps the header with stripHeader %s", async (stripHeader) => {
+    const seen = await getRaw(await serveWith(stripHeader), sent);
+
+    expect(seen.token).toBe("tok");
+    expect(seen.headers).toHaveProperty("x-ik-token", "tok");
+    expect(seen.headersDistinct).toHaveProperty("x-ik-token", ["tok"]);
+    expect(seen.rawHeaders).toContain("x-ik-token");
   });
 });
 

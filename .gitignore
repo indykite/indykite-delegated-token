@@ -36,3 +36,6 @@ coverage/
 *.tsbuildinfo
 npm-debug.log*
 pnpm-debug.log*
+
+# Local notes, plans and reviews
+.private/
