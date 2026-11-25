@@ -37,19 +37,32 @@ import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
-const HOST = process.env.HOST ?? "0.0.0.0";
-const PORT = Number(process.env.PORT ?? "8000");
+const HOST = env("HOST", "0.0.0.0");
+const PORT = port();
 const ALLOW_HTTP = process.env.ALLOW_HTTP === "1";
 // One for the process, so the targets' answers are cached
 const REGISTRY = new ExtensionRegistry({ allowHttp: ALLOW_HTTP });
 
-/** The value of the environment variable `name`. Throw if it is not set. */
-function env(name: string): string {
+/** The value of the environment variable `name`, or `fallback`. An empty value counts as unset. Throw if neither. */
+function env(name: string, fallback?: string): string {
   const value = process.env[name];
-  if (!value) {
+  if (value) {
+    return value;
+  }
+  if (fallback === undefined) {
     throw new Error(`${name} is not set`);
   }
-  return value;
+  return fallback;
+}
+
+/** The port in `PORT` (default 8000). Throw if it is not a port number. */
+function port(): number {
+  const value = env("PORT", "8000");
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 0 || number > 65535) {
+    throw new Error(`PORT is not a port number: ${value}`);
+  }
+  return number;
 }
 
 /** The text blocks of an MCP tool result, joined by newlines. */

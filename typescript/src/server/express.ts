@@ -18,13 +18,50 @@
  * @packageDocumentation
  */
 
-import type { RequestHandler } from "express";
+import type { Request, RequestHandler } from "express";
 
+import { DELEGATED_TOKEN_HEADER } from "../constants.js";
 import { runWithToken, tokenFromHeaders } from "../context.js";
 
-/** Run the rest of each request with its `X-IK-Token` header as the delegated token. */
-export function delegatedToken(): RequestHandler {
+export interface DelegatedTokenOptions {
+  /**
+   * Remove `X-IK-Token` from the request after reading it, so the handlers reach the token only through
+   * `getDelegatedToken()`. Default: `false`.
+   */
+  // `exactOptionalPropertyTypes`: callers can pass `undefined`
+  stripHeader?: boolean | undefined; // skipcq
+}
+
+const HEADER = DELEGATED_TOKEN_HEADER.toLowerCase();
+
+/**
+ * Run the rest of each request with its `X-IK-Token` header as the delegated token.
+ *
+ * Mount it before every other middleware and handler: those mounted before it still see the header.
+ *
+ * With `stripHeader`, the header is also removed from `req.headers`, `req.headersDistinct` and `req.rawHeaders`.
+ * `@a2a-js/sdk`, for example, copies all request headers into the call context of its executors. Do not set it in front
+ * of an MCP server whose tools call `tokenFromContext()`: they read the header from the request, so they would see no
+ * token.
+ */
+export function delegatedToken(options: DelegatedTokenOptions = {}): RequestHandler {
   return (req, _res, next) => {
-    runWithToken(tokenFromHeaders(req.headers), next);
+    const token = tokenFromHeaders(req.headers);
+    if (options.stripHeader) {
+      stripToken(req);
+    }
+    runWithToken(token, next);
   };
+}
+
+/** Remove `X-IK-Token` from the request. Node gives `req.headers` lowercase names, and `rawHeaders` name-value pairs. */
+function stripToken(req: Request): void {
+  // Node builds `headersDistinct` from `rawHeaders` on first read, up to the original header count. Build it now,
+  // before `rawHeaders` gets shorter, or reading it later throws.
+  // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- the name is a constant
+  delete req.headersDistinct[HEADER];
+  // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- the name is a constant
+  delete req.headers[HEADER];
+  // Name-value pairs: drop each matching name and the value after it
+  req.rawHeaders = req.rawHeaders.filter((_, i, raw) => raw[i - (i % 2)]?.toLowerCase() !== HEADER);
 }

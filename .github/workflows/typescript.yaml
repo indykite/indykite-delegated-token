@@ -92,4 +92,6 @@ jobs:
         uses: indykite/.github/.github/actions/git-checkout@master # actions/checkout with dynamic fetch-depth resolution
 
       - name: docker build
-        run: docker build -f examples/sample-mcp-server/Dockerfile -t indykite-delegated-token-sample .
+        run: |-
+          docker build -f examples/sample-mcp-server/Dockerfile -t indykite-delegated-token-sample .
+          docker build -f examples/sample-a2a-agent/Dockerfile -t indykite-delegated-token-sample-agent .

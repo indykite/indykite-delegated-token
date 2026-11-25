@@ -36,6 +36,7 @@ import { Client as ClientV1 } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport as TransportV1 } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpServer } from "@modelcontextprotocol/server";
 import express, { type Express } from "express";
+import { onTestFinished } from "vitest";
 
 import { DelegatedTokenInterceptor, delegatedTokenClientOptions } from "../src/client/a2a.js";
 import type { FetchLike } from "../src/client/fetch.js";
@@ -71,6 +72,13 @@ export async function serve(factory: (url: string) => RequestListener | FetchHan
         });
       }),
   };
+}
+
+/** Serve the handler for the current test, close it when the test ends, and return its URL. */
+export async function serveForTest(factory: Parameters<typeof serve>[0]): Promise<string> {
+  const server = await serve(factory);
+  onTestFinished(() => server.close());
+  return server.url;
 }
 
 /** A tool result with one text content. */

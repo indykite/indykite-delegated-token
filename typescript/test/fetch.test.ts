@@ -29,7 +29,7 @@ import {
 import { metadataUrl } from "../src/client/discovery.js";
 import { MCP_EXTENSION_ID, runWithToken } from "../src/index.js";
 
-import { serve } from "./harness.js";
+import { serveForTest } from "./harness.js";
 
 const TARGET = "https://mcp.example.com/mcp";
 const METADATA = "https://mcp.example.com/.well-known/oauth-protected-resource/mcp";
@@ -123,15 +123,6 @@ function form(name: string, value: string): FormData {
 /** The content of a body, comparable across copies: the entries of a form, the text of anything else. */
 function payload(body: RequestInit["body"]): Promise<unknown> {
   return body instanceof FormData ? Promise.resolve([...body]) : new Response(body).text();
-}
-
-/** A promise and the function that resolves it. */
-function deferred() {
-  let resolve: (response: Response) => void = () => undefined;
-  const promise = new Promise<Response>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
 }
 
 afterEach(() => {
@@ -254,18 +245,14 @@ describe("Request input", () => {
   });
 
   it("sends a keepalive request with a body through the native fetch", async () => {
-    const target = await serve(() => (req, res) => {
+    const target = await serveForTest(() => (req, res) => {
       let body = "";
       req.on("data", (chunk: Buffer) => (body += chunk.toString()));
       req.on("end", () => res.end(`${body} ${req.headers["x-ik-token"]?.toString() ?? ""}`));
     });
-    try {
-      const request = new Request(target.url, { method: "POST", body: "hi", keepalive: true });
-      const response = await delegatedTokenFetch()(request, { headers: { "X-IK-Token": "caller" } });
-      expect(await response.text()).toBe("hi caller");
-    } finally {
-      await target.close();
-    }
+    const request = new Request(target, { method: "POST", body: "hi", keepalive: true });
+    const response = await delegatedTokenFetch()(request, { headers: { "X-IK-Token": "caller" } });
+    expect(await response.text()).toBe("hi caller");
   });
 
   it.each([
@@ -274,28 +261,21 @@ describe("Request input", () => {
     ["an unknown algorithm only", "md5-abc", "final"],
     ["a wrong hash", "sha256-abc", "integrity mismatch"],
   ])("checks the integrity of the final response, through the native fetch: %s", async (_name, integrity, outcome) => {
-    const target = await serve(() => (req, res) => {
+    const target = await serveForTest(() => (req, res) => {
       if (req.url === "/start") {
         res.writeHead(302, { Location: "/end" }).end();
         return;
       }
       res.end("final");
     });
-    try {
-      const guarded = redirectGuard();
-      const init = { headers: { "X-IK-Token": "caller" }, integrity };
-      for (const call of [
-        () => guarded(`${target.url}/start`, init),
-        () => guarded(new Request(`${target.url}/start`, init)),
-      ]) {
-        if (outcome === "integrity mismatch") {
-          await expect(call()).rejects.toThrow(outcome);
-          continue;
-        }
-        expect(await (await call()).text()).toBe(outcome);
+    const guarded = redirectGuard();
+    const init = { headers: { "X-IK-Token": "caller" }, integrity };
+    for (const call of [() => guarded(`${target}/start`, init), () => guarded(new Request(`${target}/start`, init))]) {
+      if (outcome === "integrity mismatch") {
+        await expect(call()).rejects.toThrow(outcome);
+        continue;
       }
-    } finally {
-      await target.close();
+      expect(await (await call()).text()).toBe(outcome);
     }
   });
 
@@ -341,7 +321,7 @@ describe("Request input", () => {
   });
 
   it.each([["a URL"], ["a Request"]])("sends the headers of %s as they were at the call", async (form) => {
-    const metadata = deferred();
+    const metadata = Promise.withResolvers<Response>();
     const { send, fetch } = setup({ [METADATA]: () => metadata.promise, [TARGET]: ok });
     const headers = new Headers({ Authorization: "A" });
     const request = new Request(TARGET, { headers });
@@ -376,7 +356,7 @@ describe("Request input", () => {
       },
     ],
   ] as const)("sends a %s body as it was at the call", async (_name, make, change) => {
-    const metadata = deferred();
+    const metadata = Promise.withResolvers<Response>();
     const { send, fetch } = setup({ [METADATA]: () => metadata.promise, [TARGET]: ok });
     const body = make("A");
     const call = withToken(() => fetch(TARGET, { method: "POST", body }));
@@ -520,20 +500,16 @@ describe("401 challenge", () => {
   });
 
   it("keeps the URL and type of a fetched 401", async () => {
-    const served = await serve((url) => (req, res) => {
+    const served = await serveForTest((url) => (req, res) => {
       const challenge = `Bearer resource_metadata="${url}/prm"`;
       res.writeHead(req.url === "/mcp" ? 401 : 404, { "WWW-Authenticate": challenge }).end("denied");
     });
-    try {
-      const fetch = delegatedTokenFetch({ registry: new ExtensionRegistry() });
-      const response = await withToken(() => fetch(`${served.url}/mcp`));
-      expect(response.status).toBe(401);
-      expect(response.url).toBe(`${served.url}/mcp`);
-      expect(response.clone().type).toBe("basic");
-      expect(await response.text()).toBe("denied");
-    } finally {
-      await served.close();
-    }
+    const fetch = delegatedTokenFetch({ registry: new ExtensionRegistry() });
+    const response = await withToken(() => fetch(`${served}/mcp`));
+    expect(response.status).toBe(401);
+    expect(response.url).toBe(`${served}/mcp`);
+    expect(response.clone().type).toBe("basic");
+    expect(await response.text()).toBe("denied");
   });
 
   it("passes on the cancel of a 401 larger than the limit", async () => {
@@ -753,7 +729,7 @@ describe("metadata fetch", () => {
     ["first", 0],
     ["later", 1],
   ])("lets the %s caller stop waiting, and gives the others the shared answer", async (_name, aborting) => {
-    const metadata = deferred();
+    const metadata = Promise.withResolvers<Response>();
     const { send, fetch } = setup({ [METADATA]: () => metadata.promise, [TARGET]: ok });
     const controllers = [new AbortController(), new AbortController()];
     const calls = controllers.map((controller) => withToken(() => fetch(TARGET, { signal: controller.signal })));
@@ -791,7 +767,7 @@ describe("metadata fetch", () => {
   });
 
   it("lets a caller stop waiting for the link of a 401", async () => {
-    const link = deferred();
+    const link = Promise.withResolvers<Response>();
     const { send, fetch } = setup({ [METADATA]: notFound, [LINK]: () => link.promise, [TARGET]: () => unauthorized() });
     const controller = new AbortController();
     const call = withToken(() => fetch(TARGET, { signal: controller.signal }));
