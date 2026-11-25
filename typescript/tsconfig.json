@@ -17,7 +17,15 @@
     "declarationMap": true,
     "sourceMap": true,
     "rootDir": ".",
-    "outDir": "dist"
+    "outDir": "dist",
+    "paths": {
+      "@indykite/delegated-token": ["./src/index.ts"],
+      "@indykite/delegated-token/a2a": ["./src/client/a2a.ts"],
+      "@indykite/delegated-token/express": ["./src/server/express.ts"],
+      "@indykite/delegated-token/fetch": ["./src/client/fetch.ts"],
+      "@indykite/delegated-token/hono": ["./src/server/hono.ts"],
+      "@indykite/delegated-token/mcp-handler": ["./src/server/mcp-handler.ts"]
+    }
   },
-  "include": ["src", "test", "*.config.ts"]
+  "include": ["src", "test", "examples", "*.config.ts"]
 }

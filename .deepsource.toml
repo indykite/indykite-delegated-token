@@ -31,6 +31,8 @@ dependency_file_paths = ["typescript/package.json"]
   plugins = []
   environment = ["nodejs"]
   dialect = "typescript"
+  # the analyzer cannot tell exported functions from private helpers; the exported API is documented
+  skip_doc_coverage = ["function-declaration", "method-definition"]
 
 #
 [[transformers]]
