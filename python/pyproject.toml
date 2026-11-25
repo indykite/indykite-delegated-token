@@ -8,7 +8,7 @@ description = "IndyKite delegated token propagation for AI agents and MCP server
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
-version = "0.0.0"
+version = "0.1.0"
 authors = [
     { name = "IndyKite", email = "develop@indykite.com" },
 ]
