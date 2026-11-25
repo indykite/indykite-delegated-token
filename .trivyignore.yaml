@@ -14,3 +14,14 @@ licenses:
       - "typescript/examples/**"
       - "typescript/dist/**"
     statement: IndyKite copyright header of first-party source code
+vulnerabilities:
+  - id: CVE-2026-45829
+    statement: 'See workflow run: https://github.com/indykite/indykite-delegated-token/actions/runs/45598275056; generated 2026-11-25T10:47:29Z by trivy-notify'
+  - id: CVE-2026-45833
+    statement: 'See workflow run: https://github.com/indykite/indykite-delegated-token/actions/runs/45598275056; generated 2026-11-25T10:47:29Z by trivy-notify'
+  - id: CVE-2026-45830
+    statement: 'See workflow run: https://github.com/indykite/indykite-delegated-token/actions/runs/45598275056; generated 2026-11-25T10:47:29Z by trivy-notify'
+  - id: CVE-2026-45831
+    statement: 'See workflow run: https://github.com/indykite/indykite-delegated-token/actions/runs/45598275056; generated 2026-11-25T10:47:29Z by trivy-notify'
+  - id: CVE-2026-118764
+    statement: 'See workflow run: https://github.com/indykite/indykite-delegated-token/actions/runs/45598275056; generated 2026-11-25T10:47:29Z by trivy-notify'
