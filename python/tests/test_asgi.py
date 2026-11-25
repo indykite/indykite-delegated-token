@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
+import pytest
+from _harness import MCP_MAJOR, call_tool, mcp_session, sdk, serve
 
-from indykite_delegated_token import get_delegated_token
+from indykite_delegated_token import get_delegated_token, install
 from indykite_delegated_token.server.asgi import DelegatedTokenASGIMiddleware
 
 
@@ -65,3 +68,96 @@ async def test_other_scopes_pass_through() -> None:
 
     await app()({"type": "lifespan"}, receive, send)
     assert sent == [{"type": "lifespan.startup.complete", "token": None}]
+
+
+def recorder(seen: list[Any]) -> Any:
+    """An app that records the scope and the delegated token it was called with."""
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        seen.append((scope, get_delegated_token()))
+
+    return inner
+
+
+async def noop_receive() -> Any:
+    return {}
+
+
+async def noop_send(_: Any) -> None:
+    return None
+
+
+async def test_strip_header() -> None:
+    headers = [
+        (b"accept", b"a"),
+        (b"X-IK-Token", b"tok"),
+        (b"x-custom", b"1"),
+        (b"x-ik-token", b"other"),
+        (b"x-custom", b"2"),
+        (b"authorization", b"Bearer b"),
+    ]
+    original = list(headers)
+    scope = {"type": "http", "headers": headers}
+    seen: list[Any] = []
+
+    await DelegatedTokenASGIMiddleware(recorder(seen), strip_header=True)(scope, noop_receive, noop_send)
+
+    [(app_scope, token)] = seen
+    assert token is None  # two token headers are ambiguous, so none is used
+    assert app_scope["headers"] == [
+        (b"accept", b"a"),
+        (b"x-custom", b"1"),
+        (b"x-custom", b"2"),
+        (b"authorization", b"Bearer b"),
+    ]
+    assert scope == {"type": "http", "headers": original}
+    assert scope["headers"] is headers
+
+
+async def test_strip_header_without_headers() -> None:
+    seen: list[Any] = []
+    await DelegatedTokenASGIMiddleware(recorder(seen), strip_header=True)({"type": "http"}, noop_receive, noop_send)
+    assert seen == [({"type": "http", "headers": []}, None)]
+
+
+async def test_keep_header_by_default() -> None:
+    scope = {"type": "http", "headers": [(b"x-ik-token", b"tok")]}
+    seen: list[Any] = []
+    await DelegatedTokenASGIMiddleware(recorder(seen))(scope, noop_receive, noop_send)
+    assert seen == [(scope, "tok")]
+    assert seen[0][0] is scope
+
+
+@pytest.mark.parametrize("kind", ["lifespan", "websocket"])
+async def test_strip_header_other_scopes_pass_through(kind: str) -> None:
+    scope = {"type": kind, "headers": [(b"x-ik-token", b"tok")]}
+    seen: list[Any] = []
+    await DelegatedTokenASGIMiddleware(recorder(seen), strip_header=True)(scope, noop_receive, noop_send)
+    assert seen == [(scope, None)]
+    assert seen[0][0] is scope
+
+
+def whoami_server() -> Any:
+    """A stateless MCP server with ``install()`` and a tool that returns the delegated token it sees."""
+    if MCP_MAJOR >= 2:
+        server = sdk("mcp.server.mcpserver").MCPServer("whoami")
+    else:
+        server = sdk("mcp.server.fastmcp").FastMCP("whoami", stateless_http=True, json_response=True)
+
+    @server.tool()
+    async def whoami() -> str:
+        return json.dumps(get_delegated_token())
+
+    install(server)
+    if MCP_MAJOR >= 2:
+        return server.streamable_http_app(stateless_http=True, json_response=True)
+    return server.streamable_http_app()
+
+
+@pytest.mark.parametrize(("strip", "expected"), [(False, "tok"), (True, None)])
+async def test_install_behind_strip_header(strip: bool, expected: str | None) -> None:
+    """``install()`` reads the header from the request, so a stripping middleware hides the token from it."""
+    pytest.importorskip("mcp")
+    app = DelegatedTokenASGIMiddleware(whoami_server(), strip_header=strip)
+    async with serve(lambda _: app) as base, mcp_session(f"{base}/mcp", headers={"X-IK-Token": "tok"}) as session:
+        assert await call_tool(session, "whoami") == expected

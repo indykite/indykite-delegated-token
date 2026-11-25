@@ -31,11 +31,20 @@ Environment:
 
 import os
 import uuid
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
-from a2a.types.a2a_pb2 import ROLE_USER, TASK_STATE_COMPLETED, Message, Part, SendMessageRequest, TaskState
+from a2a.types.a2a_pb2 import (
+    ROLE_USER,
+    TASK_STATE_COMPLETED,
+    AgentCard,
+    Message,
+    Part,
+    SendMessageRequest,
+    TaskState,
+)
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
@@ -70,11 +79,22 @@ async def call_mcp_tool(tool: str, arguments: dict[str, object] | None = None) -
     return "\n".join(getattr(content, "text", "") for content in result.content)
 
 
+def require_same_origin(card: AgentCard, url: str) -> None:
+    """Raises if the card lists an interface on another origin than ``url``, so the token goes only to the target."""
+    expected = urlsplit(url)
+    for interface in card.supported_interfaces:
+        actual = urlsplit(interface.url)
+        if (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc):
+            raise ValueError(f"the target's card lists an interface on another origin: {interface.url}")
+
+
 @server.tool()
 async def ask_agent(text: str) -> str:
     """Send a message to the A2A agent at TARGET_AGENT_URL and return its text reply."""
     async with httpx.AsyncClient(timeout=60) as http:
-        card = await A2ACardResolver(http, os.environ["TARGET_AGENT_URL"]).get_agent_card()
+        url = os.environ["TARGET_AGENT_URL"]
+        card = await A2ACardResolver(http, url).get_agent_card()
+        require_same_origin(card, url)
         client = ClientFactory(ClientConfig(streaming=False, httpx_client=http)).create(
             card,
             interceptors=[

@@ -5,12 +5,12 @@ Python package for the delegated token propagation of the IndyKite Agent Gateway
 > [!WARNING]
 > Work in progress, not published to PyPI yet.
 
-The agent gateway in front of an MCP server sends the delegated token of the workflow in the `X-IK-Token` header.
-When a tool of that server calls another MCP server or an A2A agent through the next gateway, the call must carry the
-token too, or the gateway refuses it. This package does both halves:
+The agent gateway in front of an MCP server or an A2A agent sends the delegated token of the workflow in the
+`X-IK-Token` header. When that server or agent calls another MCP server or A2A agent through the next gateway, the
+call must carry the token too, or the gateway refuses it. This package does both halves:
 
-- **server side**: `install(server)` makes the token of the request being handled available to its tools, through
-  `get_delegated_token()`;
+- **server side**: `install(server)` for MCP servers, or an ASGI middleware for A2A agents, makes the token of the
+  request being handled available through `get_delegated_token()`;
 - **client side**: an HTTP client for MCP calls and an interceptor for A2A calls send it on, to the targets that
   announce the delegated token extension and to no others.
 
@@ -58,13 +58,48 @@ real one to one the caller forged.
 FastMCP tools declared with `task=True` are not supported: they run as background tasks after their request has been
 handled, possibly in another process, and see no token.
 
-For other ASGI apps, such as A2A agents built with a2a-sdk, wrap the app in the ASGI middleware:
+### A2A agent: receive the token
+
+An A2A agent built with a2a-sdk is a Starlette or FastAPI app. Add `DelegatedTokenASGIMiddleware` as its outermost
+middleware, with `strip_header=True`:
 
 ```python
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+
 from indykite_delegated_token.server.asgi import DelegatedTokenASGIMiddleware
 
-app = DelegatedTokenASGIMiddleware(app)
+app = Starlette(
+    routes=[*create_agent_card_routes(card), *create_jsonrpc_routes(handler, "/")],
+    middleware=[Middleware(DelegatedTokenASGIMiddleware, strip_header=True)],
+)
 ```
+
+With FastAPI: `app.add_middleware(DelegatedTokenASGIMiddleware, strip_header=True)`.
+
+The executor reads the token with `get_delegated_token()`, and the clients below send it on. Each `execute` call sees
+the token of the request that sent its message, also for a follow-up message to an existing task and for streaming
+requests. The agent card does not need to list the extension: the gateway declares it.
+
+`strip_header=True` removes `X-IK-Token` from the request that the app sees, so the token is reachable only through
+`get_delegated_token()`. a2a-sdk copies all request headers into its call context and logs that context at DEBUG;
+with the flag, the token is not in those logs. The flag is off by default. Do not set it in front of an MCP server
+that uses `install()`: `install()` reads the header from the request, so it would see no token.
+
+The middleware works for JSON-RPC and REST. The gateway exposes JSON-RPC only; gRPC is not supported.
+
+Work that leaves the request, such as a queue or another process, must carry the token itself: read it with
+`get_delegated_token()` and restore it in the worker with `use_token(token)`. Tasks the executor starts in the same
+process keep the token of their request, also after the response is sent. The token may expire before such work ends;
+the next gateway then refuses the call.
+
+> [!WARNING]
+> Do not pass this package's HTTP clients to a2a-sdk's push notification sender. It sends from the context of the
+> request that started the task, so every push would carry that first request's token. Push notifications with the
+> delegated token are not supported.
+
+For other ASGI apps, wrap the app: `app = DelegatedTokenASGIMiddleware(app)`.
 
 ### Client: send the token on
 
@@ -191,7 +226,18 @@ A request carries `X-IK-Token` only when there is a token and the target announc
 > receives the token. Call only targets that your server's operator configured, such as `TARGET_MCP_URL` in the
 > examples, never a URL that comes from the tool's caller or from a model.
 
-## Example
+### Security
+
+- **Reach the server or agent only through its gateway.** It trusts any `X-IK-Token` it receives. The gateway
+  overwrites the header, but a caller that reaches the server directly can send any token.
+- **Reach other agents and MCP servers only through gateways**, with TLS on every hop. Use network policy to stop
+  calls to anything else.
+- **Add the ASGI middleware outermost.** Middleware above it still sees the header.
+- **Keep the token out of logs and traces.** a2a-sdk logs request headers at DEBUG: use `strip_header=True`. It logs
+  `Authorization` the same way. If you enable OpenTelemetry header capture
+  (`OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_*`), leave `X-IK-Token` out of it.
+
+## Examples
 
 [`examples/sample_mcp_server`](examples/sample_mcp_server) is a runnable MCP server (SDK 2.x) with two tools,
 `call_mcp_tool` and `ask_agent`, which call an MCP server and an A2A agent through their gateways. Smaller versions
@@ -207,6 +253,29 @@ docker run -p 8000:8000 \
 
 The server accepts any `Host` header, as it would behind a gateway that reaches it by a name of its own. Set
 `ALLOWED_HOSTS`, such as `ALLOWED_HOSTS=sample-mcp:*`, to accept only those.
+
+[`examples/sample_a2a_agent`](examples/sample_a2a_agent) is a runnable A2A agent (a2a-sdk, MCP SDK 2.x) that does
+the same without a model. A message with a data part `{"mcp_tool": "<name>", "arguments": {...}}` calls that tool on
+`TARGET_MCP_URL`; any other message is sent as text to the agent at `TARGET_AGENT_URL`. The reply is a completed task
+with one text artifact. `PUBLIC_URL` is the agent's URL in its card.
+
+```sh
+docker build -f examples/sample_a2a_agent/Dockerfile -t indykite-delegated-token-sample-agent .
+docker run -p 8000:8000 \
+  -e PUBLIC_URL=https://sample-agent.internal.example.com \
+  -e TARGET_MCP_URL=https://gateway.example.com/mcp \
+  -e TARGET_AGENT_URL=https://agent-gateway.example.com \
+  indykite-delegated-token-sample-agent
+```
+
+To check the chain against real gateways:
+
+1. Deploy the sample agent behind a gateway with a token service, and point `TARGET_MCP_URL` and `TARGET_AGENT_URL`
+   at targets behind gateways with a token service.
+2. Send a message to the sample agent's gateway with a user token, for example `hi` for the A2A target, or a data part
+   `{"mcp_tool": "whoami"}` for an MCP target with such a tool.
+3. In the target's logs, or with the gateway's `whoami`, check that the target received `X-IK-Token` with the user,
+   the sample agent's gateway and the target's gateway in the chain.
 
 ## Development
 
