@@ -23,8 +23,9 @@ import importlib
 import json
 import socket
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
@@ -34,7 +35,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from indykite_delegated_token import A2A_EXTENSION_URI, MCP_EXTENSION_ID
+from indykite_delegated_token import A2A_EXTENSION_URI, MCP_EXTENSION_ID, use_token
 from indykite_delegated_token.client import ExtensionRegistry
 
 try:
@@ -86,11 +87,15 @@ def _prm_route(base_url: str, announce: bool) -> Route:
 _target_seen: ContextVar[str | None] = ContextVar("target_seen", default=None)
 
 
-def mcp_target(announce: bool) -> AppFactory:
-    """A stateless MCP server with an ``echo`` tool that returns the ``X-IK-Token`` it received.
+def mcp_target(
+    announce: bool, records: dict[str, str | None] | None = None, *, require_token: bool = False
+) -> AppFactory:
+    """A stateless MCP server with an ``echo(tag)`` tool that returns the ``X-IK-Token`` it received.
 
-    Stateless with JSON responses, each message is handled within its HTTP request, so a plain ASGI wrapper records
-    the header. The targets do not use the package.
+    With ``records``, ``echo`` also stores ``tag -> X-IK-Token`` in it. With ``require_token``, MCP messages without
+    ``X-IK-Token`` get 401, as a gateway answers ``initialize`` and ``tools/list`` only with a token. Stateless with
+    JSON responses, each message is handled within its HTTP request, so a plain ASGI wrapper records the header. The
+    targets do not use the package.
     """
 
     def factory(base_url: str) -> Any:
@@ -100,8 +105,11 @@ def mcp_target(announce: bool) -> AppFactory:
             server = sdk("mcp.server.fastmcp").FastMCP("target", stateless_http=True, json_response=True)
 
         @server.tool()
-        async def echo() -> str:
-            return json.dumps(_target_seen.get())
+        async def echo(tag: str = "") -> str:
+            seen = _target_seen.get()
+            if records is not None:
+                records[tag] = seen
+            return json.dumps(seen)
 
         if MCP_MAJOR >= 2:
             app = server.streamable_http_app(stateless_http=True, json_response=True)
@@ -112,6 +120,9 @@ def mcp_target(announce: bool) -> AppFactory:
         async def recording(scope: Any, receive: Any, send: Any) -> None:
             headers = dict(scope.get("headers") or ())
             seen = headers.get(b"x-ik-token")
+            if require_token and seen is None and scope.get("path") == "/mcp":
+                await Response(status_code=401)(scope, receive, send)
+                return
             reset = _target_seen.set(seen.decode() if seen is not None else None)
             try:
                 await app(scope, receive, send)
@@ -235,3 +246,34 @@ async def call_tool(session: Any, name: str, arguments: dict[str, Any] | None = 
     is_error = getattr(result, "is_error", None) if MCP_MAJOR >= 2 else getattr(result, "isError", None)
     assert not is_error, result
     return json.loads(result.content[0].text)
+
+
+@dataclass
+class Run:
+    """One of the two concurrent runs of :func:`check_concurrent_runs`."""
+
+    tag: str
+    announcing: str  # URL of the MCP target that announces the extension
+    silent: str  # URL of the MCP target that does not
+    barrier: asyncio.Barrier  # shared by both runs: wait on it before the tool calls
+
+
+async def check_concurrent_runs(run: Callable[[Run], Awaitable[None]]) -> None:
+    """Start runs ``A`` and ``B`` together, under ``token-A`` and ``token-B``.
+
+    Each run calls ``echo(tag)`` on both targets. Checks that the announcing target got each run's own token, and
+    the silent target got none.
+    """
+    announced: dict[str, str | None] = {}
+    silent: dict[str, str | None] = {}
+    barrier = asyncio.Barrier(2)
+    async with serve(mcp_target(True, announced)) as good, serve(mcp_target(False, silent)) as bad:
+
+        async def one(tag: str) -> None:
+            with use_token(f"token-{tag}"):
+                await run(Run(tag, f"{good}/mcp", f"{bad}/mcp", barrier))
+
+        async with asyncio.timeout(60):
+            await asyncio.gather(one("A"), one("B"))
+    assert announced == {"A": "token-A", "B": "token-B"}
+    assert silent == {"A": None, "B": None}

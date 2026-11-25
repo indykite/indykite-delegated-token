@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from contextvars import ContextVar
 from functools import partial
 from types import TracebackType
 from typing import Any, Protocol, Self, TypeVar
@@ -40,8 +41,10 @@ __all__ = [
     "WrappingTransport",
     "environment_proxies",
     "handle",
+    "in_chain",
     "metadata_timeout",
     "read_raw",
+    "sending",
 ]
 
 # The most of a metadata answer or of a 401 that is read: both are small, and a target must not be able to make the
@@ -99,6 +102,9 @@ class _Transport(Protocol):
 # request into the redirect it builds from it
 _FIRST_URL = "indykite_delegated_token.first_url"
 
+# Set while the package sends a request, so the global hook does not handle it a second time
+_sending: ContextVar[bool] = ContextVar("indykite_delegated_token_sending", default=False)
+
 Req = TypeVar("Req", bound=_Request)
 Resp = TypeVar("Resp", bound=_Response)
 
@@ -106,6 +112,27 @@ Resp = TypeVar("Resp", bound=_Response)
 # the connection is free. If not, the response replays what was read and then streams the rest.
 # It closes the response and raises if the body does not arrive within `deadline` seconds, or on any other error.
 Buffer = Callable[[Resp, int, float], Awaitable[tuple[Resp, bool]]]
+
+
+def sending() -> bool:
+    """Whether the current request is sent by :func:`handle`."""
+    return _sending.get()
+
+
+def in_chain(request: _Request) -> bool:
+    """Whether ``request`` belongs to a redirect chain that :func:`handle` started."""
+    return _FIRST_URL in request.extensions
+
+
+def _flagged(send: Callable[[Req], Awaitable[Resp]]) -> Callable[[Req], Awaitable[Resp]]:
+    async def flagged(request: Req) -> Resp:
+        reset = _sending.set(True)
+        try:
+            return await send(request)
+        finally:
+            _sending.reset(reset)
+
+    return flagged
 
 
 def _replayable(request: _Request) -> bool:
@@ -238,18 +265,14 @@ class WrappingTransport:
         await self._transport.aclose()
 
 
-def _token_for(request: _Request, target: str, first_url: str, registry: ExtensionRegistry) -> str | None:
-    """The token ``request`` may carry if its target announces, or ``None`` when it must go out unchanged."""
-    token = get_delegated_token()
-    if token is None or DELEGATED_TOKEN_HEADER in request.headers:
-        return None
+def _may_carry(target: str, first_url: str, registry: ExtensionRegistry) -> bool:
+    """Whether ``target`` may get the token if it announces the extension."""
     if not within_origin(first_url, target):
         # A redirect to another origin, or from https to http: the token only goes where the caller sent the request,
         # or to its https upgrade, never where a server sends it on, even if that announces the extension
-        return None
-    if not registry.allow_http and not secure_transport(target):
-        return None  # neither the token nor the metadata that announces it would be protected
-    return token
+        return False
+    # Over plain HTTP, neither the token nor the metadata that announces it would be protected
+    return registry.allow_http or secure_transport(target)
 
 
 async def _fetch_metadata(
@@ -285,32 +308,42 @@ async def handle(
     *,
     send: Callable[[Req], Awaitable[Resp]],
     make_get: Callable[[str, Req], Req],
-    with_header: Callable[[Req, str, str], Req],
+    with_header: Callable[[Req, str, str | None], Req],
     buffer: Buffer[Resp],
     registry: ExtensionRegistry,
 ) -> Resp:
-    """Send ``request``, with the delegated token if the target announced the extension.
+    """Send ``request``, with the delegated token only if the target announced the extension.
+
+    The token is the one the caller set in ``X-IK-Token``, or else the one of the context. A target that does not
+    announce, another origin after a redirect, or plain HTTP without ``allow_http``, gets no token, also when the
+    caller set it.
 
     ``send`` sends a request through the wrapped transport. ``make_get(url, request)`` builds a plain GET request for
     the metadata fetch, without any of the client's headers but with the timeout of ``request``.
-    ``with_header(request, name, value)`` returns a copy of ``request`` with one more header. ``buffer`` reads a
-    response's body up to a limit, see :data:`Buffer`.
+    ``with_header(request, name, value)`` returns a copy of ``request`` with the header set, or removed when ``value``
+    is ``None``. ``buffer`` reads a response's body up to a limit, see :data:`Buffer`.
 
     ``request`` itself is never changed, but for one extension that records where a redirect chain started: the
     client builds redirects and retries from it, and they must not carry the token to a target that did not announce
     the extension, or to another origin. Each of them comes back through this function.
     """
+    send = _flagged(send)
     target = str(request.url)
     first_url = str(request.extensions.setdefault(_FIRST_URL, target))
-    token = _token_for(request, target, first_url, registry)
+    token = request.headers.get(DELEGATED_TOKEN_HEADER) or get_delegated_token()
     if token is None:
         return await send(request)
+    bare = request
+    if DELEGATED_TOKEN_HEADER in request.headers:
+        bare = with_header(request, DELEGATED_TOKEN_HEADER, None)
+    if not _may_carry(target, first_url, registry):
+        return await send(bare)
 
     fetch = partial(_fetch_metadata, send, make_get, buffer, request)
     if await registry.discover(target, fetch):
         return await send(with_header(request, DELEGATED_TOKEN_HEADER, token))
 
-    response = await send(request)
+    response = await send(bare)
     if response.status_code != 401 or not _replayable(request):
         return response
     challenge = response.headers.get("www-authenticate")
