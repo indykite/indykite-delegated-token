@@ -18,7 +18,7 @@ import { debuglog } from "node:util";
 import { DELEGATED_TOKEN_HEADER } from "./constants.js";
 
 /** Web `Headers`, Node `IncomingHttpHeaders`, or a plain record of header values. */
-export type HeadersLike = Headers | Record<string, string | string[] | undefined>;
+export type HeadersLike = Headers | Readonly<Record<string, string | readonly string[] | undefined>>;
 
 const log = debuglog("indykite-delegated-token");
 

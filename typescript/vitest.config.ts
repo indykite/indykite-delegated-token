@@ -16,7 +16,17 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    include: ["test/**/*.test.ts"],
+    projects: [
+      { extends: true, test: { name: "unit", include: ["test/*.test.ts"] } },
+      {
+        extends: true,
+        test: {
+          name: "frameworks",
+          include: ["test/frameworks/**/*.test.ts"],
+          testTimeout: 60_000,
+        },
+      },
+    ],
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts"],

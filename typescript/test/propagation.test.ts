@@ -43,6 +43,7 @@ import { withDelegatedToken } from "../src/server/mcp-handler.js";
 import {
   a2aAgent,
   askAgent,
+  barrier,
   interceptorOnly,
   type FetchHandler,
   mcpSession,
@@ -112,22 +113,6 @@ beforeAll(async () => {
 afterAll(async () => {
   await Promise.all(servers.map((server) => server.close()));
 });
-
-/** A barrier for `parties` callers, reusable after each release. */
-function barrier(parties: number): () => Promise<void> {
-  let waiting: (() => void)[] = [];
-  return () =>
-    new Promise((resolve) => {
-      waiting.push(resolve);
-      if (waiting.length < parties) {
-        return;
-      }
-      for (const release of waiting) {
-        release();
-      }
-      waiting = [];
-    });
-}
 
 async function echo(version: SdkVersion, url: string, registry: ExtensionRegistry): Promise<unknown> {
   const session = await mcpSession(version, url, delegatedTokenFetch({ registry }));

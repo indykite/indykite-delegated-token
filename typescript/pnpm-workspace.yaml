@@ -1,0 +1,9 @@
+# Install scripts of dependencies of the agent frameworks (devDependencies). None is needed: their binaries come
+# prebuilt or are unused by the tests.
+---
+allowBuilds:
+  "@google/genai": false
+  cpu-features: false
+  esbuild: false
+  protobufjs: false
+  ssh2: false
