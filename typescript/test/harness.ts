@@ -36,11 +36,12 @@ import { Client as ClientV1 } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport as TransportV1 } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpServer } from "@modelcontextprotocol/server";
 import express, { type Express } from "express";
-import { onTestFinished } from "vitest";
+import { expect, onTestFinished } from "vitest";
+import { z } from "zod";
 
 import { DelegatedTokenInterceptor, delegatedTokenClientOptions } from "../src/client/a2a.js";
 import type { FetchLike } from "../src/client/fetch.js";
-import { A2A_EXTENSION_URI, MCP_EXTENSION_ID } from "../src/index.js";
+import { A2A_EXTENSION_URI, MCP_EXTENSION_ID, runWithToken } from "../src/index.js";
 
 export type SdkVersion = "v1" | "v2";
 
@@ -86,13 +87,16 @@ export function text(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
 
+/** The `X-IK-Token` that each `echo` call received, by its `tag`. */
+export type Records = Record<string, string | null>;
+
 /**
  * A stateless MCP server at `/mcp` with an `echo` tool that returns the `X-IK-Token` it received.
  *
  * With `announce`, its protected resource metadata lists the extension. Without, the metadata route answers 404.
- * The targets do not use the package.
+ * With `records`, `echo({ tag })` also stores `tag -> X-IK-Token` in it. The targets do not use the package.
  */
-export function mcpTarget(announce: boolean): (url: string) => Express {
+export function mcpTarget(announce: boolean, records?: Records): (url: string) => Express {
   return (url) => {
     const app = express();
     app.use(express.json());
@@ -105,9 +109,14 @@ export function mcpTarget(announce: boolean): (url: string) => Express {
     });
     app.post("/mcp", async (req, res) => {
       const server = new McpServer({ name: "target", version: "1.0.0" });
-      server.registerTool("echo", { description: "Return the X-IK-Token header" }, (ctx) =>
-        text(ctx.http?.req?.headers.get("x-ik-token") ?? null),
-      );
+      const inputSchema = z.object({ tag: z.string().optional() });
+      server.registerTool("echo", { description: "Return the X-IK-Token header", inputSchema }, ({ tag }, ctx) => {
+        const seen = ctx.http?.req?.headers.get("x-ik-token") ?? null;
+        if (records && tag !== undefined) {
+          records[tag] = seen;
+        }
+        return text(seen);
+      });
       const transport = new NodeStreamableHTTPServerTransport({ enableJsonResponse: true });
       res.on("close", () => {
         server.close().catch(() => undefined);
@@ -120,6 +129,66 @@ export function mcpTarget(announce: boolean): (url: string) => Express {
     });
     return app;
   };
+}
+
+/** A barrier for `parties` callers, reusable after each release. */
+export function barrier(parties: number): () => Promise<void> {
+  let waiting: (() => void)[] = [];
+  return () =>
+    new Promise((resolve) => {
+      waiting.push(resolve);
+      if (waiting.length < parties) {
+        return;
+      }
+      for (const release of waiting) {
+        release();
+      }
+      waiting = [];
+    });
+}
+
+/** One of the two concurrent runs of {@link checkConcurrentRuns}. */
+export interface Run {
+  tag: string;
+  /** URL of the MCP target that announces the extension. */
+  announcing: string;
+  /** URL of the MCP target that does not. */
+  silent: string;
+  /** Shared by both runs: wait on it before the tool calls. */
+  barrier: () => Promise<void>;
+}
+
+/**
+ * Start runs `A` and `B` together, under `token-A` and `token-B`.
+ *
+ * Each run calls `echo({ tag })` on both targets. Check that the announcing target got each run's own token, and the
+ * silent target got none.
+ */
+export async function checkConcurrentRuns(run: (run: Run) => Promise<void>): Promise<void> {
+  const good = await recordingTarget(true);
+  const bad = await recordingTarget(false);
+  const wait = barrier(2);
+  const one = (tag: string) =>
+    runWithToken(`token-${tag}`, () => run({ tag, announcing: good.url, silent: bad.url, barrier: wait }));
+  await Promise.all([one("A"), one("B")]);
+  expect(good.records).toEqual({ A: "token-A", B: "token-B" });
+  expect(bad.records).toEqual({ A: null, B: null });
+}
+
+/** The run of `tag`, for a server that serves both runs of {@link checkConcurrentRuns}. */
+export function runOf(runs: Map<string, Run>, tag: string): Run {
+  const run = runs.get(tag);
+  if (!run) {
+    throw new Error(`unknown run: ${tag}`);
+  }
+  return run;
+}
+
+/** A target served for the current test, with the MCP URL and the records of its `echo` tool. */
+export async function recordingTarget(announce: boolean): Promise<{ url: string; records: Records }> {
+  const records: Records = {};
+  const url = await serveForTest(mcpTarget(announce, records));
+  return { url: `${url}/mcp`, records };
 }
 
 function header(headers: RequestHeaders | undefined, name: string): string | null {

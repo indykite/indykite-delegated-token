@@ -21,6 +21,22 @@
       "groupName": "typescript non-major dependencies",
       "groupSlug": "typescript-minor-patch",
       "commitMessagePrefix": "chore(typescript): "
+    },
+    {
+      // after the rule above, so it wins for these packages
+      "description": "TypeScript: the agent frameworks of the framework tests in one PR",
+      "matchFileNames": ["typescript/**"],
+      "matchPackageNames": [
+        "ai",
+        "@ai-sdk/**",
+        "@google/adk",
+        "@langchain/**",
+        "@mastra/**",
+        "@openai/agents"
+      ],
+      "groupName": "typescript agent frameworks",
+      "groupSlug": "typescript-agent-frameworks",
+      "commitMessagePrefix": "chore(typescript): "
     }
   ]
 }

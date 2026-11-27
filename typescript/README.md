@@ -211,6 +211,111 @@ Set `NODE_DEBUG=indykite-delegated-token` to log the metadata fetches that fail 
 > receives the token. Call only targets that your server's operator configured, such as `TARGET_MCP_URL` in the
 > examples, never a URL that comes from the tool's caller or from a model.
 
+### Agent frameworks
+
+Agent frameworks send the token on through `delegatedTokenFetch()`. Two rules apply to all of them:
+
+- **Open the MCP client, toolset or server inside the request**, never at startup, and do not share it between
+  requests. The gateway lists tools only for a token, filtered for its user. A client kept across requests would list
+  one user's tools for another.
+- **Give the wrapper to the MCP client only**, never to the client of the model provider. Do not set `X-IK-Token` as a
+  static header: a static header goes to every server, also to those that do not announce the extension.
+
+| Framework                                                 | MCP SDK        | Hook                                                     |
+| --------------------------------------------------------- | -------------- | -------------------------------------------------------- |
+| Vercel AI SDK 7, `@ai-sdk/mcp` 2                          | its own client | `transport: { type: "http", url, fetch }`                |
+| LangChain.js, LangGraph.js: `@langchain/mcp-adapters` 2.x | 2.x            | build the `Client` with `fetch`, then `loadMcpTools`     |
+| Mastra 1.85, `@mastra/mcp` 2.10, `MCPClient`              | 2.x            | `servers: { name: { url, fetch } }`                      |
+| Mastra server (Hono)                                      | -              | `server: { middleware: delegatedToken() }` from `./hono` |
+| OpenAI Agents SDK 0.22, `MCPServerStreamableHttp`         | 2.x            | `new MCPServerStreamableHttp({ url, fetch })`            |
+| Google ADK 2.5, `MCPToolset`                              | 1.x            | `transportOptions: { fetch }`                            |
+
+In each case `fetch` is `delegatedTokenFetch()`. Three of them need more than the hook:
+
+**Vercel AI SDK** - tools run in the async context of the `streamText` call, also while the response streams after
+the handler returned:
+
+```ts
+const mcp = await createMCPClient({ transport: { type: "http", url: TARGET_MCP_URL, fetch: delegatedTokenFetch() } });
+const close = () => mcp.close(); // on every way out: `onEnd` does not run on error or abort
+try {
+  const result = streamText({
+    model,
+    tools: await mcp.tools(),
+    stopWhen: stepCountIs(3),
+    prompt,
+    onEnd: close,
+    onError: close,
+    onAbort: close,
+  });
+  return createUIMessageStreamResponse({ stream: toUIMessageStream({ stream: result.stream }) });
+} catch (error) {
+  await close(); // the stream never started, so none of its callbacks run
+  throw error;
+}
+```
+
+This assumes the default `streamRetries: 0`. With retries, `onError` also runs on an error that gets retried, and the
+client would close before the retry.
+
+**LangChain.js / LangGraph.js** - build the MCP client yourself and hand it to `loadMcpTools`:
+
+```ts
+const client = new Client({ name: "my-agent", version: "1.0.0" }); // inside the request
+try {
+  await client.connect(new StreamableHTTPClientTransport(new URL(TARGET_MCP_URL), { fetch: delegatedTokenFetch() }));
+  const tools = await loadMcpTools("target", client);
+  // run the agent with tools
+} finally {
+  await client.close();
+}
+```
+
+`MultiServerMCPClient` cannot carry the token: its connections take no `fetch`, and headers returned by
+`beforeToolCall` open and keep one connection per distinct token. Graphs served by the LangGraph server run outside
+the HTTP request and are not supported.
+
+**Mastra** - mount the Hono middleware on the Mastra server, then build the `MCPClient` inside the request:
+
+```ts
+export const mastra = new Mastra({ agents, server: { middleware: delegatedToken() } });
+
+const mcp = new MCPClient({
+  id: randomUUID(),
+  servers: { target: { url: new URL(TARGET_MCP_URL), fetch: delegatedTokenFetch() } },
+});
+try {
+  // run the agent with await mcp.listTools()
+} finally {
+  await mcp.disconnect(); // Mastra keeps every MCPClient, and process listeners for it, until it disconnects
+}
+```
+
+Mastra skips `server.middleware` on its public routes and on routes registered with `requiresAuth: false`. There the
+tools get no token, and the calls fail. Keep auth on for routes that run agents, or wrap the handler in
+`runWithToken(tokenFromHeaders(c.req.raw.headers), ...)`.
+
+The Express, Fastify and Koa adapters of Mastra ignore `server.middleware`. With Express, mount `delegatedToken()` of
+`./express` on the app. Koa and Fastify need the request wrapped by hand, for example for Koa:
+
+```ts
+app.use((ctx, next) => runWithToken(tokenFromHeaders(ctx.headers), next));
+```
+
+For work outside the request, such as a background task, keep the token and run the work in
+`runWithToken(token, ...)`. Do not put the token in Mastra's `RequestContext`: Mastra may store it in workflow
+snapshots and traces.
+
+**xmcp** - export a middleware from `src/middleware.ts` of the app that runs each MCP message with its token, the same
+way:
+
+```ts
+export const mcp = (ctx, next) => runWithToken(tokenFromHeaders(ctx.http?.headers), next);
+```
+
+Do not read the token with xmcp's `headers()`: outside a request it can return the headers of another one. The
+package does not test the Koa, Fastify and xmcp snippets.
+
 ### Security
 
 - **Reach the server or agent only through its gateway.** It trusts any `X-IK-Token` it receives. The gateway
@@ -264,12 +369,15 @@ To check the chain against real gateways:
 
 ## Development
 
-The tests run against MCP SDK 1.x and 2.x in one install.
+The tests run against MCP SDK 1.x and 2.x in one install. The framework tests in `test/frameworks` connect each
+framework's MCP client to fake MCP servers; for the Vercel AI SDK and the Mastra server they run a full agent with a
+scripted model.
 
 ```sh
 corepack enable                    # use the pnpm version from package.json
 pnpm install
 pnpm test                          # unit and end-to-end tests
+pnpm test:frameworks               # tests with the agent frameworks
 pnpm lint && pnpm format:check && pnpm typecheck
 pnpm build                         # compile to dist/
 ```
